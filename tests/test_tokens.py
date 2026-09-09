@@ -1,6 +1,8 @@
-import time
-
-from fastapi_accounts.security.tokens import TimedTokenSigner, generate_secure_token, hash_token
+from fastapi_accounts.security.tokens import (
+    TimedTokenSigner,
+    generate_secure_token,
+    hash_token,
+)
 
 
 def test_secure_token_and_hash():
@@ -15,7 +17,9 @@ def test_secure_token_and_hash():
 
 def test_timed_token_signer_valid():
     signer = TimedTokenSigner("secret-12345")
-    token = signer.create_token({"email": "test@example.com", "action": "verify_email"}, max_age_seconds=60)
+    token = signer.create_token(
+        {"email": "test@example.com", "action": "verify_email"}, max_age_seconds=60
+    )
 
     payload = signer.verify_token(token)
     assert payload is not None

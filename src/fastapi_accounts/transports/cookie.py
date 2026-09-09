@@ -1,4 +1,4 @@
-from typing import Literal, Optional
+from typing import Literal
 
 from fastapi import Request, Response
 
@@ -13,7 +13,7 @@ class CookieTransport(BaseTransport):
         cookie_name: str = "fastapi_accounts_session",
         max_age: int = 86400 * 14,  # 14 days
         path: str = "/",
-        domain: Optional[str] = None,
+        domain: str | None = None,
         secure: bool = False,
         httponly: bool = True,
         samesite: Literal["lax", "strict", "none"] = "lax",
@@ -26,7 +26,7 @@ class CookieTransport(BaseTransport):
         self.httponly = httponly
         self.samesite = samesite
 
-    def extract_token(self, request: Request) -> Optional[str]:
+    def extract_token(self, request: Request) -> str | None:
         return request.cookies.get(self.cookie_name)
 
     def set_login_response(self, response: Response, token: str) -> None:

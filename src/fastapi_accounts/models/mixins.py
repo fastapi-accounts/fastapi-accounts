@@ -1,6 +1,5 @@
 import uuid
 from datetime import datetime, timezone
-from typing import Optional
 
 from sqlalchemy import Boolean, DateTime, ForeignKey, String
 from sqlalchemy.orm import Mapped, declared_attr, mapped_column
@@ -46,7 +45,9 @@ class EmailAddressMixin:
 
     @declared_attr
     def user_id(cls) -> Mapped[uuid.UUID]:
-        return mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False)
+        return mapped_column(
+            ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False
+        )
 
     @declared_attr
     def email(cls) -> Mapped[str]:
@@ -75,7 +76,10 @@ class PasswordCredentialMixin:
     @declared_attr
     def user_id(cls) -> Mapped[uuid.UUID]:
         return mapped_column(
-            ForeignKey("users.id", ondelete="CASCADE"), unique=True, index=True, nullable=False
+            ForeignKey("users.id", ondelete="CASCADE"),
+            unique=True,
+            index=True,
+            nullable=False,
         )
 
     @declared_attr
@@ -103,7 +107,9 @@ class SessionMixin:
 
     @declared_attr
     def user_id(cls) -> Mapped[uuid.UUID]:
-        return mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False)
+        return mapped_column(
+            ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False
+        )
 
     @declared_attr
     def created_at(cls) -> Mapped[datetime]:
@@ -114,9 +120,9 @@ class SessionMixin:
         return mapped_column(DateTime(timezone=True), index=True, nullable=False)
 
     @declared_attr
-    def ip_address(cls) -> Mapped[Optional[str]]:
+    def ip_address(cls) -> Mapped[str | None]:
         return mapped_column(String(45), nullable=True)
 
     @declared_attr
-    def user_agent(cls) -> Mapped[Optional[str]]:
+    def user_agent(cls) -> Mapped[str | None]:
         return mapped_column(String(512), nullable=True)

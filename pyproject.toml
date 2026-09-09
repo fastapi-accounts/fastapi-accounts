@@ -51,8 +51,13 @@ packages = ["src/fastapi_accounts"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 asyncio_mode = "auto"
+
+[tool.ruff.lint]
+ignore = ["B008"]
+
 [project.urls]
 Homepage = "https://github.com/fastapi-accounts/fastapi-accounts"
 Documentation = "https://github.com/fastapi-accounts/fastapi-accounts"
 Repository = "https://github.com/fastapi-accounts/fastapi-accounts.git"
 Discussions = "https://github.com/fastapi-accounts/fastapi-accounts/discussions"
+

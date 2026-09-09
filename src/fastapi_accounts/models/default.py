@@ -18,7 +18,10 @@ class User(Base, UserMixin):
     __tablename__ = "users"
 
     emails: Mapped[list["EmailAddress"]] = relationship(
-        "EmailAddress", back_populates="user", cascade="all, delete-orphan", lazy="selectin"
+        "EmailAddress",
+        back_populates="user",
+        cascade="all, delete-orphan",
+        lazy="selectin",
     )
     password_credential: Mapped[Optional["PasswordCredential"]] = relationship(
         "PasswordCredential",
@@ -32,7 +35,7 @@ class User(Base, UserMixin):
     )
 
     @property
-    def primary_email(self) -> Optional[str]:
+    def primary_email(self) -> str | None:
         for e in self.emails:
             if e.is_primary:
                 return e.email

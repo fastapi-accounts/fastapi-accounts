@@ -1,6 +1,5 @@
 import uuid
 from datetime import datetime
-from typing import Optional
 
 from pydantic import BaseModel, ConfigDict
 
@@ -23,7 +22,7 @@ class UserRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
-    primary_email: Optional[str] = None
+    primary_email: str | None = None
     is_active: bool
     is_superuser: bool
     created_at: datetime
@@ -38,5 +37,5 @@ class SessionRead(BaseModel):
     id: str
     created_at: datetime
     expires_at: datetime
-    ip_address: Optional[str] = None
-    user_agent: Optional[str] = None
+    ip_address: str | None = None
+    user_agent: str | None = None

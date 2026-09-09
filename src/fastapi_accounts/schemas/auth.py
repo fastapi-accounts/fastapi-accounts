@@ -5,7 +5,9 @@ class RegisterRequest(BaseModel):
     """Schema for user registration."""
 
     email: EmailStr
-    password: str = Field(..., min_length=8, description="Password must be at least 8 characters.")
+    password: str = Field(
+        ..., min_length=8, description="Password must be at least 8 characters."
+    )
 
 
 class LoginRequest(BaseModel):
@@ -25,6 +27,21 @@ class RequestVerificationEmailRequest(BaseModel):
     """Schema for requesting a new email verification token."""
 
     email: EmailStr
+
+
+class RequestPasswordResetRequest(BaseModel):
+    """Schema for requesting a password reset token."""
+
+    email: EmailStr
+
+
+class ResetPasswordRequest(BaseModel):
+    """Schema for completing a password reset."""
+
+    token: str
+    new_password: str = Field(
+        ..., min_length=8, description="New password must be at least 8 characters."
+    )
 
 
 class TokenResponse(BaseModel):

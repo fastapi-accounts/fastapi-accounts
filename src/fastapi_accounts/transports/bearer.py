@@ -1,5 +1,3 @@
-from typing import Optional
-
 from fastapi import Request, Response
 
 from fastapi_accounts.transports.base import BaseTransport
@@ -11,7 +9,7 @@ class BearerTransport(BaseTransport):
     def __init__(self, header_name: str = "Authorization"):
         self.header_name = header_name
 
-    def extract_token(self, request: Request) -> Optional[str]:
+    def extract_token(self, request: Request) -> str | None:
         auth_header = request.headers.get(self.header_name)
         if not auth_header:
             return None
