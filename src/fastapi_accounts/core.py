@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi_accounts.adapters.sqlalchemy import SQLAlchemyAdapter
 from fastapi_accounts.models.default import User
 from fastapi_accounts.schemas.auth import (
+    ChangePasswordRequest,
     EmailVerificationRequest,
     LoginRequest,
     RegisterRequest,
@@ -334,6 +335,35 @@ class FastAPIAccounts:
 
             self.transport.set_logout_response(response)
             return {"message": "Logged out successfully."}
+
+        @router.post(
+            "/change-password",
+            summary="Change password for authenticated user",
+        )
+        async def change_password(
+            payload: ChangePasswordRequest,
+            request: Request,
+            user: User = Depends(self.current_active_user),
+            db: AsyncSession = Depends(self.adapter.get_db),
+        ):
+            success = await self.adapter.verify_and_update_password(
+                session=db,
+                user_id=user.id,
+                current_password=payload.current_password,
+                new_password=payload.new_password,
+            )
+            if not success:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Current password is incorrect.",
+                )
+            if payload.revoke_other_sessions:
+                raw_token = self.transport.extract_token(request)
+                if raw_token:
+                    await self.adapter.revoke_other_user_sessions(
+                        db, user.id, raw_token
+                    )
+            return {"message": "Password changed successfully."}
 
         @router.get(
             "/me",

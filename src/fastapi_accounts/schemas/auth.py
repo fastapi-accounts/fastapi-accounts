@@ -51,3 +51,15 @@ class TokenResponse(BaseModel):
 
     access_token: str
     token_type: str = "bearer"
+
+
+class ChangePasswordRequest(BaseModel):
+    """Schema for authenticated password change."""
+
+    current_password: str
+    new_password: str = Field(
+        ..., min_length=8, description="New password must be at least 8 characters."
+    )
+    revoke_other_sessions: bool = Field(
+        default=True, description="Revoke all other active sessions."
+    )

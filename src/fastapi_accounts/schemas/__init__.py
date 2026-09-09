@@ -1,4 +1,5 @@
 from fastapi_accounts.schemas.auth import (
+    ChangePasswordRequest,
     EmailVerificationRequest,
     LoginRequest,
     RegisterRequest,
@@ -10,6 +11,7 @@ from fastapi_accounts.schemas.auth import (
 from fastapi_accounts.schemas.user import EmailAddressRead, SessionRead, UserRead
 
 __all__ = [
+    "ChangePasswordRequest",
     "EmailAddressRead",
     "EmailVerificationRequest",
     "LoginRequest",

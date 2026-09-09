@@ -16,6 +16,7 @@ from fastapi_accounts.models.mixins import (
     UserMixin,
 )
 from fastapi_accounts.schemas.auth import (
+    ChangePasswordRequest,
     EmailVerificationRequest,
     LoginRequest,
     RegisterRequest,
@@ -35,6 +36,7 @@ __all__ = [
     "Base",
     "BaseTransport",
     "BearerTransport",
+    "ChangePasswordRequest",
     "CookieTransport",
     "EmailAddress",
     "EmailAddressMixin",

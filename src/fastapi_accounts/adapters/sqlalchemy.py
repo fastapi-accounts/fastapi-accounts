@@ -256,3 +256,34 @@ class SQLAlchemyAdapter:
         # Security invariant: Revoke all active sessions upon password reset
         await self.revoke_all_user_sessions(session, user_id)
         return True
+
+    async def verify_and_update_password(
+        self,
+        session: AsyncSession,
+        user_id: uuid.UUID,
+        current_password: str,
+        new_password: str,
+    ) -> bool:
+        """Verify the current password and update to a new password."""
+        stmt = select(self.credential_model).where(
+            self.credential_model.user_id == user_id
+        )
+        result = await session.execute(stmt)
+        cred = result.scalars().first()
+        if not cred or not verify_password(current_password, cred.hashed_password):
+            return False
+        cred.hashed_password = hash_password(new_password)
+        await session.flush()
+        return True
+
+    async def revoke_other_user_sessions(
+        self, session: AsyncSession, user_id: uuid.UUID, current_raw_token: str
+    ) -> int:
+        """Revoke all active sessions for a user except the current session."""
+        current_token_id = hash_token(current_raw_token)
+        stmt = delete(self.session_model).where(
+            self.session_model.user_id == user_id,
+            self.session_model.id != current_token_id,
+        )
+        result = await session.execute(stmt)
+        return result.rowcount or 0
