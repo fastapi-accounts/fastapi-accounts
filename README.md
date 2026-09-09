@@ -92,6 +92,9 @@ Visit **`http://localhost:8000/docs`** to see your fully documented authenticati
 * `POST /api/v1/auth/register`
 * `POST /api/v1/auth/verify-email`
 * `POST /api/v1/auth/request-verify-email`
+* `POST /api/v1/auth/request-password-reset`
+* `POST /api/v1/auth/reset-password`
+* `POST /api/v1/auth/change-password`
 * `POST /api/v1/auth/login`
 * `POST /api/v1/auth/logout`
 * `GET  /api/v1/auth/me`
@@ -102,10 +105,11 @@ Visit **`http://localhost:8000/docs`** to see your fully documented authenticati
 
 | Milestone | Target Capabilities | Status |
 | :--- | :--- | :---: |
-| **v0.1.0-alpha (Shipped)** | Email/Password (Argon2id), Email verification, Resend verification, Multi-email models, Async SQLAlchemy 2.0 adapter, Dual-transport (Cookies + Bearer) | ✅ **Completed** |
-| **v0.1.x (Core Hardening)** | Password reset/recovery workflows, Multi-email addition/removal, Primary email changes, PostgreSQL integration tests | 🏗️ **In Progress** |
-| **v0.2.0 (Social Accounts)** | Google OAuth2/OIDC integration, Safe social account linking with anti-takeover checks | 📋 Planned |
-| **Future Horizons** | Additional OAuth providers (GitHub, Apple), Active session device management, TOTP / MFA | 💡 Under RFC |
+| **v0.1.0-alpha** | Email/Password (Argon2id), Email verification, Timed HMAC tokens, Async SQLAlchemy 2.0, Dual-transport (Cookies + Bearer), Password reset & recovery, Authenticated password change | ✅ **Completed** |
+| **v0.2.0 (Multi-Email & DB Matrix)** | Secondary email addition/verification/removal, Primary email promotion, PostgreSQL & MySQL integration tests | 🎯 **Next Sprint** |
+| **v0.3.0 (Social Accounts)** | Google OAuth2/OIDC integration, Safe social account linking with anti-takeover verification | 📋 Planned |
+| **Future Horizons** | Additional OAuth providers (GitHub, Apple), Active session device management, TOTP / MFA, WebAuthn Passkeys | 💡 Under RFC |
+
 
 ---
 

@@ -14,12 +14,12 @@ from fastapi_accounts.models.mixins import (
 
 __all__ = [
     "Base",
-    "User",
     "EmailAddress",
-    "PasswordCredential",
-    "Session",
-    "UserMixin",
     "EmailAddressMixin",
+    "PasswordCredential",
     "PasswordCredentialMixin",
+    "Session",
     "SessionMixin",
+    "User",
+    "UserMixin",
 ]

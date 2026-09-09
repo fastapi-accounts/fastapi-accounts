@@ -1,7 +1,6 @@
 import uuid
 from collections.abc import AsyncGenerator
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional, Type
 
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import (
@@ -31,13 +30,13 @@ class SQLAlchemyAdapter:
 
     def __init__(
         self,
-        database_url: Optional[str] = None,
-        engine: Optional[AsyncEngine] = None,
-        session_maker: Optional[async_sessionmaker[AsyncSession]] = None,
-        user_model: Type[User] = User,
-        email_model: Type[EmailAddress] = EmailAddress,
-        credential_model: Type[PasswordCredential] = PasswordCredential,
-        session_model: Type[Session] = Session,
+        database_url: str | None = None,
+        engine: AsyncEngine | None = None,
+        session_maker: async_sessionmaker[AsyncSession] | None = None,
+        user_model: type[User] = User,
+        email_model: type[EmailAddress] = EmailAddress,
+        credential_model: type[PasswordCredential] = PasswordCredential,
+        session_model: type[Session] = Session,
     ):
         if session_maker:
             self.session_maker = session_maker
@@ -79,9 +78,7 @@ class SQLAlchemyAdapter:
                 await session.rollback()
                 raise
 
-    async def get_user_by_email(
-        self, session: AsyncSession, email: str
-    ) -> Optional[User]:
+    async def get_user_by_email(self, session: AsyncSession, email: str) -> User | None:
         """Find user by email address (case-insensitive)."""
         clean_email = email.strip().lower()
         stmt = (
@@ -94,7 +91,7 @@ class SQLAlchemyAdapter:
 
     async def get_user_by_id(
         self, session: AsyncSession, user_id: uuid.UUID
-    ) -> Optional[User]:
+    ) -> User | None:
         """Retrieve user by primary UUID."""
         stmt = select(self.user_model).where(self.user_model.id == user_id)
         result = await session.execute(stmt)
@@ -140,7 +137,7 @@ class SQLAlchemyAdapter:
 
     async def authenticate_user(
         self, session: AsyncSession, email: str, password: str
-    ) -> Optional[User]:
+    ) -> User | None:
         """Verify password credentials for a user by email."""
         user = await self.get_user_by_email(session, email)
         if not user or not user.is_active:
@@ -162,7 +159,7 @@ class SQLAlchemyAdapter:
 
     async def verify_email(
         self, session: AsyncSession, email: str
-    ) -> Optional[EmailAddress]:
+    ) -> EmailAddress | None:
         """Mark an email address as verified."""
         clean_email = email.strip().lower()
         stmt = select(self.email_model).where(self.email_model.email == clean_email)
@@ -181,8 +178,8 @@ class SQLAlchemyAdapter:
         user_id: uuid.UUID,
         raw_token: str,
         max_age_seconds: int = 86400 * 14,
-        ip_address: Optional[str] = None,
-        user_agent: Optional[str] = None,
+        ip_address: str | None = None,
+        user_agent: str | None = None,
     ) -> Session:
         """Create a new active session record storing the hashed token."""
         token_id = hash_token(raw_token)
@@ -201,7 +198,7 @@ class SQLAlchemyAdapter:
 
     async def get_session_and_user(
         self, session: AsyncSession, raw_token: str
-    ) -> Optional[tuple[Session, User]]:
+    ) -> tuple[Session, User] | None:
         """Retrieve active unexpired session and its associated user by raw token."""
         token_id = hash_token(raw_token)
         stmt = (
@@ -231,5 +228,62 @@ class SQLAlchemyAdapter:
     ) -> int:
         """Delete all active sessions for a user."""
         stmt = delete(self.session_model).where(self.session_model.user_id == user_id)
+        result = await session.execute(stmt)
+        return result.rowcount or 0
+
+    async def update_user_password(
+        self, session: AsyncSession, user_id: uuid.UUID, new_password: str
+    ) -> bool:
+        """Update a user's password credential and invalidate all existing sessions."""
+        stmt = select(self.credential_model).where(
+            self.credential_model.user_id == user_id
+        )
+        result = await session.execute(stmt)
+        cred = result.scalars().first()
+        if not cred:
+            user = await self.get_user_by_id(session, user_id)
+            if not user:
+                return False
+            cred = self.credential_model(
+                user_id=user_id,
+                hashed_password=hash_password(new_password),
+            )
+            session.add(cred)
+        else:
+            cred.hashed_password = hash_password(new_password)
+
+        await session.flush()
+        # Security invariant: Revoke all active sessions upon password reset
+        await self.revoke_all_user_sessions(session, user_id)
+        return True
+
+    async def verify_and_update_password(
+        self,
+        session: AsyncSession,
+        user_id: uuid.UUID,
+        current_password: str,
+        new_password: str,
+    ) -> bool:
+        """Verify the current password and update to a new password."""
+        stmt = select(self.credential_model).where(
+            self.credential_model.user_id == user_id
+        )
+        result = await session.execute(stmt)
+        cred = result.scalars().first()
+        if not cred or not verify_password(current_password, cred.hashed_password):
+            return False
+        cred.hashed_password = hash_password(new_password)
+        await session.flush()
+        return True
+
+    async def revoke_other_user_sessions(
+        self, session: AsyncSession, user_id: uuid.UUID, current_raw_token: str
+    ) -> int:
+        """Revoke all active sessions for a user except the current session."""
+        current_token_id = hash_token(current_raw_token)
+        stmt = delete(self.session_model).where(
+            self.session_model.user_id == user_id,
+            self.session_model.id != current_token_id,
+        )
         result = await session.execute(stmt)
         return result.rowcount or 0
