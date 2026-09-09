@@ -98,21 +98,51 @@ async def get_me(user = Depends(accounts.current_active_user)):
 
 ---
 
-## 🗺️ Chapter 6: The Near-Term Focus
+## 🗺️ Chapter 6: Day 1 Launch & Community Reaction
 
-We are building this project **100% in the open**, focusing on pragmatic, production-tested steps rather than premature feature sprawl.
+In early September 2026, we tagged `v0.1.0a1` on PyPI and introduced **FastAPI Accounts** to the community on GitHub Discussions and Hacker News:
+> *"Show HN: FastAPI Accounts – 15-line batteries-included account engine for FastAPI"*
 
-Our current roadmap:
-- [x] **v0.1.0-alpha (Shipped):** Core Email/Password, Email Verification lifecycle, Session Management, Dual Transports (Cookie + Bearer), Async SQLAlchemy 2.0.
-- [ ] **v0.1.x (Hardening & Core Account Flows):**
-  - Password reset & recovery workflow (`/request-password-reset`, `/reset-password`).
-  - Multi-email management (adding secondary emails, changing primary email).
-  - PostgreSQL & MySQL integration tests alongside SQLite.
-- [ ] **v0.2.0 (First Social Provider):**
+The response reinforced our core conviction: developers were tired of fragmented auth snippets and vendor lock-in. The community wanted a rock-solid, production-grade library that handled the messy security edge cases without getting in their way.
+
+---
+
+## 🛡️ Chapter 7: Hardening the Steel Thread — Complete Credential Lifecycles
+
+With the core vertical slice validated, we immediately tackled the most critical security workflows required by real-world applications:
+
+### 1. Password Reset & Account Recovery
+* Built `POST /request-password-reset` with **anti-account enumeration protection** (always returning generic HTTP 200 to neutralize email scraping).
+* Built `POST /reset-password` using short-lived (15 min) cryptographic HMAC tokens bound strictly to `action="reset_password"`.
+* **The Security Invariant:** Resetting a password immediately invalidates **all** active database sessions across all devices to kick out unauthorized sessions.
+
+### 2. Authenticated Password Change
+* Built `POST /change-password` guarded by `current_active_user`.
+* Enforced **mandatory re-authentication** (`current_password` verification) to prevent unauthorized takeover from unattended devices.
+* Added **selective session revocation**: by default (`revoke_other_sessions=True`), changing a password logs out all *other* devices while keeping the caller's current session seamless and active.
+
+### 3. 100% Test Coverage & Standardized Operations
+* Expanded our automated test suite to **18 end-to-end tests** running in `< 2.0s`.
+* Documented every QA check and PyPI deployment step in a comprehensive [**RELEASE.md**](RELEASE.md) guide.
+* Shipped the full implementation in Pull Request [#3](https://github.com/fastapi-accounts/fastapi-accounts/pull/3).
+
+---
+
+## 🗺️ What's Next on the Horizon
+
+We are building this project **100% in the open**, maintaining radical simplicity and rock-solid security invariants.
+
+Our updated roadmap:
+- [x] **v0.1.0-alpha (Shipped):** Core Email/Password, Email Verification lifecycle, Session Management, Dual Transports (Cookie + Bearer), Password Reset & Recovery, Authenticated Password Change.
+- [ ] **v0.2.0 (Multi-Email & DB Matrix):**
+  - Multi-email management (adding secondary emails, verification, promoting to primary).
+  - PostgreSQL & MySQL integration tests running in CI alongside SQLite.
+- [ ] **v0.3.0 (First Social Provider):**
   - Google OAuth2/OIDC integration with anti-takeover verification checks.
 - [ ] **Future Horizons (Community-Driven):**
-  - Additional OAuth providers (GitHub, Apple) and MFA/TOTP as real user demand dictates.
+  - Additional OAuth providers (GitHub, Apple), Passkeys / WebAuthn, and TOTP / MFA.
 
-We believe that open source thrives on honesty, community collaboration, and relentless focus on developer experience. 
+We believe open source thrives on honesty, community collaboration, and relentless focus on developer experience. 
 
 If you want to help shape the future of authentication in FastAPI, join our [GitHub Discussions](https://github.com/fastapi-accounts/fastapi-accounts/discussions) and build with us! 🚀
+
