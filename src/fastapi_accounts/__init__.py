@@ -30,7 +30,7 @@ from fastapi_accounts.transports.base import BaseTransport
 from fastapi_accounts.transports.bearer import BearerTransport
 from fastapi_accounts.transports.cookie import CookieTransport
 
-__version__ = "0.1.0a1"
+__version__ = "0.1.0a2"
 
 __all__ = [
     "Base",
