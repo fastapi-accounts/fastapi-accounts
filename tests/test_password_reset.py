@@ -47,14 +47,16 @@ async def test_password_reset_flow_e2e(cookie_accounts: FastAPIAccounts):
         assert "password reset link has been sent" in req_reset_resp.json()["message"]
 
         # 5. Generate token directly for testing reset endpoint
-        user = await cookie_accounts.adapter.get_user_by_email(
-            await cookie_accounts.adapter.session_maker().__aenter__(),
-            "charlie@example.com",
-        )
-        assert user is not None
-        reset_token = cookie_accounts.generate_password_reset_token(
-            user.id, "charlie@example.com"
-        )
+        async with cookie_accounts.adapter.session_maker() as session:
+            user = await cookie_accounts.adapter.get_user_by_email(
+                session, "charlie@example.com"
+            )
+            assert user is not None
+            reset_token = cookie_accounts.generate_password_reset_token(
+                user.id,
+                "charlie@example.com",
+                pwd_ts=user.password_credential.password_updated_at,
+            )
 
         # 6. Complete password reset with new password
         reset_resp = await client.post(
@@ -119,11 +121,11 @@ async def test_password_reset_tampered_and_expired_tokens(
             json={"email": "david@example.com", "password": "DavidPassword123!"},
         )
 
-        user = await cookie_accounts.adapter.get_user_by_email(
-            await cookie_accounts.adapter.session_maker().__aenter__(),
-            "david@example.com",
-        )
-        assert user is not None
+        async with cookie_accounts.adapter.session_maker() as session:
+            user = await cookie_accounts.adapter.get_user_by_email(
+                session, "david@example.com"
+            )
+            assert user is not None
 
         # 1. Tampered signature
         valid_token = cookie_accounts.generate_password_reset_token(
@@ -178,11 +180,11 @@ async def test_cross_action_token_isolation(cookie_accounts: FastAPIAccounts):
         assert "Invalid or expired" in cross_resp1.json()["detail"]
 
         # 2. Try to use a password reset token to verify email
-        user = await cookie_accounts.adapter.get_user_by_email(
-            await cookie_accounts.adapter.session_maker().__aenter__(),
-            "eve@example.com",
-        )
-        assert user is not None
+        async with cookie_accounts.adapter.session_maker() as session:
+            user = await cookie_accounts.adapter.get_user_by_email(
+                session, "eve@example.com"
+            )
+            assert user is not None
         reset_token = cookie_accounts.generate_password_reset_token(
             user.id, "eve@example.com"
         )
@@ -203,7 +205,7 @@ async def test_custom_password_reset_callback(adapter: SQLAlchemyAdapter):
 
     accounts = FastAPIAccounts(
         adapter=adapter,
-        secret_key="callback-test-secret",
+        secret_key="callback-test-secret-at-least-32-chars-long",
         transport=CookieTransport(),
         on_after_request_password_reset=custom_callback,
     )

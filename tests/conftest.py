@@ -36,7 +36,7 @@ async def adapter(session_maker, async_engine):
 def cookie_accounts(adapter):
     return FastAPIAccounts(
         adapter=adapter,
-        secret_key="test-secret-key-12345",
+        secret_key="test-secret-key-at-least-32-characters-long-1234567890",
         transport=CookieTransport(),
         verify_email_required=False,
     )
@@ -46,7 +46,7 @@ def cookie_accounts(adapter):
 def bearer_accounts(adapter):
     return FastAPIAccounts(
         adapter=adapter,
-        secret_key="test-secret-key-12345",
+        secret_key="test-secret-key-at-least-32-characters-long-1234567890",
         transport=BearerTransport(),
         verify_email_required=False,
     )

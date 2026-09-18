@@ -73,7 +73,6 @@ class SQLAlchemyAdapter:
         async with self.session_maker() as session:
             try:
                 yield session
-                await session.commit()
             except Exception:
                 await session.rollback()
                 raise
@@ -94,6 +93,16 @@ class SQLAlchemyAdapter:
     ) -> User | None:
         """Retrieve user by primary UUID."""
         stmt = select(self.user_model).where(self.user_model.id == user_id)
+        result = await session.execute(stmt)
+        return result.scalars().first()
+
+    async def get_password_credential(
+        self, session: AsyncSession, user_id: uuid.UUID
+    ) -> PasswordCredential | None:
+        """Retrieve password credential for a given user ID."""
+        stmt = select(self.credential_model).where(
+            self.credential_model.user_id == user_id
+        )
         result = await session.execute(stmt)
         return result.scalars().first()
 
@@ -128,6 +137,7 @@ class SQLAlchemyAdapter:
         credential = self.credential_model(
             user_id=user.id,
             hashed_password=hash_password(password),
+            password_updated_at=utc_now(),
         )
         session.add(credential)
         await session.flush()
@@ -235,6 +245,7 @@ class SQLAlchemyAdapter:
         self, session: AsyncSession, user_id: uuid.UUID, new_password: str
     ) -> bool:
         """Update a user's password credential and invalidate all existing sessions."""
+        now = utc_now()
         stmt = select(self.credential_model).where(
             self.credential_model.user_id == user_id
         )
@@ -247,10 +258,12 @@ class SQLAlchemyAdapter:
             cred = self.credential_model(
                 user_id=user_id,
                 hashed_password=hash_password(new_password),
+                password_updated_at=now,
             )
             session.add(cred)
         else:
             cred.hashed_password = hash_password(new_password)
+            cred.password_updated_at = now
 
         await session.flush()
         # Security invariant: Revoke all active sessions upon password reset
@@ -273,6 +286,7 @@ class SQLAlchemyAdapter:
         if not cred or not verify_password(current_password, cred.hashed_password):
             return False
         cred.hashed_password = hash_password(new_password)
+        cred.password_updated_at = utc_now()
         await session.flush()
         return True
 
