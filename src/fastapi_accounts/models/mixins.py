@@ -87,6 +87,10 @@ class PasswordCredentialMixin:
         return mapped_column(String(1024), nullable=False)
 
     @declared_attr
+    def password_updated_at(cls) -> Mapped[datetime]:
+        return mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+    @declared_attr
     def created_at(cls) -> Mapped[datetime]:
         return mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 

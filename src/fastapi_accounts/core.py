@@ -3,6 +3,7 @@ import logging
 import os
 import uuid
 from collections.abc import Callable
+from datetime import datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
@@ -29,6 +30,13 @@ from fastapi_accounts.transports.cookie import CookieTransport
 logger = logging.getLogger("fastapi_accounts")
 
 
+def _get_pwd_state_ts(dt: datetime | None) -> int:
+    """Return microsecond epoch integer for password state tracking."""
+    if dt is None:
+        return 0
+    return int(dt.timestamp() * 1_000_000)
+
+
 class FastAPIAccounts:
     """Core authentication and account management engine for FastAPI."""
 
@@ -40,6 +48,7 @@ class FastAPIAccounts:
         verify_email_required: bool = False,
         session_max_age_seconds: int = 86400 * 14,
         reset_password_token_max_age_seconds: int = 900,
+        debug: bool = False,
         on_after_register: Callable[[User, str], Any] | None = None,
         on_after_request_password_reset: Callable[[User, str], Any] | None = None,
     ):
@@ -48,16 +57,24 @@ class FastAPIAccounts:
         # Resolve secret key from environment if prefixed with env:
         if secret_key.startswith("env:"):
             env_var = secret_key.split("env:", 1)[1]
-            self.secret_key = os.environ.get(env_var, "")
-            if not self.secret_key:
+            resolved_key = os.environ.get(env_var, "")
+            if not resolved_key:
                 raise ValueError(f"Environment variable '{env_var}' is not set.")
+            self.secret_key = resolved_key
         else:
             self.secret_key = secret_key
+
+        if not self.secret_key or len(self.secret_key) < 32:
+            raise ValueError(
+                "FastAPIAccounts secret_key must be a non-empty string of at least 32 characters (256 bits). "
+                "Generate a secure key using `secrets.token_urlsafe(32)`."
+            )
 
         self.transport = transport or CookieTransport()
         self.verify_email_required = verify_email_required
         self.session_max_age_seconds = session_max_age_seconds
         self.reset_password_token_max_age_seconds = reset_password_token_max_age_seconds
+        self.debug = debug
         self.on_after_register = on_after_register
         self.on_after_request_password_reset = on_after_request_password_reset
 
@@ -77,13 +94,26 @@ class FastAPIAccounts:
             return payload.get("email")
         return None
 
-    def generate_password_reset_token(self, user_id: uuid.UUID, email: str) -> str:
-        """Generate a cryptographically signed password reset token."""
+    def generate_password_reset_token(
+        self,
+        user_id: uuid.UUID,
+        email: str,
+        pwd_ts: int | datetime | None = None,
+    ) -> str:
+        """Generate a cryptographically signed password reset token bound to current password state."""
+        if isinstance(pwd_ts, datetime):
+            ts_val = _get_pwd_state_ts(pwd_ts)
+        elif isinstance(pwd_ts, int):
+            ts_val = pwd_ts
+        else:
+            ts_val = 0
+
         return self.token_signer.create_token(
             {
                 "sub": str(user_id),
                 "email": email.strip().lower(),
                 "action": "reset_password",
+                "pwd_ts": ts_val,
             },
             max_age_seconds=self.reset_password_token_max_age_seconds,
         )
@@ -98,36 +128,40 @@ class FastAPIAccounts:
     async def _dispatch_verification_email(
         self, user: User, email: str, token: str
     ) -> None:
-        """Trigger developer-supplied callback or log token to console in development."""
+        """Trigger developer-supplied callback or log event in development/production."""
         if self.on_after_register:
             if inspect.iscoroutinefunction(self.on_after_register):
                 await self.on_after_register(user, token)
             else:
                 self.on_after_register(user, token)
         else:
-            logger.info(
-                f"📨 [FastAPI Accounts] Verification token for '{email}': {token}"
-            )
-            print(
-                f"\n📨 [FastAPI Accounts] Verification link for '{email}': /api/v1/auth/verify-email with token: {token}\n"
-            )
+            if self.debug:
+                logger.debug(
+                    f"📨 [FastAPI Accounts] Verification token generated for '{email}' (prefix: {token[:8]}...)"
+                )
+            else:
+                logger.info(
+                    f"📨 [FastAPI Accounts] Verification email requested for '{email}'."
+                )
 
     async def _dispatch_password_reset_email(
         self, user: User, email: str, token: str
     ) -> None:
-        """Trigger developer-supplied callback or log password reset token to console."""
+        """Trigger developer-supplied callback or log event."""
         if self.on_after_request_password_reset:
             if inspect.iscoroutinefunction(self.on_after_request_password_reset):
                 await self.on_after_request_password_reset(user, token)
             else:
                 self.on_after_request_password_reset(user, token)
         else:
-            logger.info(
-                f"🔑 [FastAPI Accounts] Password reset token for '{email}': {token}"
-            )
-            print(
-                f"\n🔑 [FastAPI Accounts] Password reset link for '{email}': /api/v1/auth/reset-password with token: {token}\n"
-            )
+            if self.debug:
+                logger.debug(
+                    f"🔑 [FastAPI Accounts] Password reset token generated for '{email}' (prefix: {token[:8]}...)"
+                )
+            else:
+                logger.info(
+                    f"🔑 [FastAPI Accounts] Password reset requested for '{email}'."
+                )
 
     def _build_router(self) -> APIRouter:
         router = APIRouter()
@@ -150,7 +184,10 @@ class FastAPIAccounts:
                     password=payload.password,
                     is_verified=False,
                 )
+                await db.commit()
+                await db.refresh(user)
             except ValueError as e:
+                await db.rollback()
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)
                 )
@@ -162,7 +199,7 @@ class FastAPIAccounts:
                 user, email_record.email, verification_token
             )
 
-            return user
+            return UserRead.model_validate(user)
 
         @router.post(
             "/verify-email",
@@ -186,6 +223,7 @@ class FastAPIAccounts:
                     detail="Email address not found.",
                 )
 
+            await db.commit()
             return {"message": "Email address verified successfully."}
 
         @router.post(
@@ -226,7 +264,18 @@ class FastAPIAccounts:
         ):
             user = await self.adapter.get_user_by_email(db, payload.email)
             if user and user.is_active:
-                token = self.generate_password_reset_token(user.id, payload.email)
+                cred = await self.adapter.get_password_credential(db, user.id)
+                pwd_ts = _get_pwd_state_ts(
+                    cred.password_updated_at
+                    if cred
+                    else (
+                        getattr(user, "password_credential", None)
+                        and user.password_credential.password_updated_at
+                    )
+                )
+                token = self.generate_password_reset_token(
+                    user.id, payload.email, pwd_ts=pwd_ts
+                )
                 await self._dispatch_password_reset_email(user, payload.email, token)
 
             # Always return a generic success message to prevent email enumeration
@@ -257,6 +306,22 @@ class FastAPIAccounts:
                     detail="Invalid token payload.",
                 )
 
+            cred = await self.adapter.get_password_credential(db, user_id)
+            if not cred:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="User account not found.",
+                )
+
+            current_pwd_ts = _get_pwd_state_ts(cred.password_updated_at)
+            token_pwd_ts = token_data.get("pwd_ts")
+            # Enforce single-use: token must match current password timestamp
+            if token_pwd_ts is not None and token_pwd_ts != current_pwd_ts:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Invalid or expired password reset token.",
+                )
+
             success = await self.adapter.update_user_password(
                 session=db, user_id=user_id, new_password=payload.new_password
             )
@@ -266,10 +331,12 @@ class FastAPIAccounts:
                     detail="User account not found.",
                 )
 
+            await db.commit()
             return {"message": "Password has been reset successfully."}
 
         @router.post(
             "/login",
+            response_model=UserRead | TokenResponse,
             summary="Authenticate with email and password",
         )
         async def login(
@@ -309,6 +376,7 @@ class FastAPIAccounts:
                 ip_address=client_ip,
                 user_agent=user_agent,
             )
+            await db.commit()
 
             # Set response headers or cookies based on transport
             self.transport.set_login_response(response, raw_session_token)
@@ -318,7 +386,7 @@ class FastAPIAccounts:
                     access_token=raw_session_token, token_type="bearer"
                 )
 
-            return user
+            return UserRead.model_validate(user)
 
         @router.post(
             "/logout",
@@ -332,6 +400,7 @@ class FastAPIAccounts:
             raw_token = self.transport.extract_token(request)
             if raw_token:
                 await self.adapter.revoke_session(db, raw_token)
+                await db.commit()
 
             self.transport.set_logout_response(response)
             return {"message": "Logged out successfully."}
@@ -363,6 +432,7 @@ class FastAPIAccounts:
                     await self.adapter.revoke_other_user_sessions(
                         db, user.id, raw_token
                     )
+            await db.commit()
             return {"message": "Password changed successfully."}
 
         @router.get(
@@ -413,10 +483,11 @@ class FastAPIAccounts:
 
     async def current_superuser(
         self,
-        user: User = Depends(lambda: None),
+        request: Request,
     ) -> User:
         """Dependency that returns the authenticated superuser, or raises 403 Forbidden."""
-        if not user or not user.is_superuser:
+        user = await self.current_active_user(request)
+        if not user.is_superuser:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Superuser privileges are required.",
