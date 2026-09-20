@@ -1,6 +1,6 @@
 # FastAPI Accounts ⚡
 
-*Modern, zero-boilerplate authentication and complete account management for FastAPI.*
+*Modern, zero-boilerplate authentication and account management for FastAPI.*
 
 [![PyPI](https://img.shields.io/pypi/v/fastapi-accounts?color=brightgreen&label=PyPI)](https://pypi.org/project/fastapi-accounts)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/fastapi-accounts/fastapi-accounts/blob/main/LICENSE)
@@ -22,7 +22,7 @@ Today, building authentication in FastAPI usually means either:
 2. **Wrestling with complex generic typing and multi-file wiring** in older libraries that are now in maintenance mode.
 3. **Paying steep monthly fees** to vendor-locked cloud auth providers (Clerk, Auth0).
 
-**FastAPI Accounts** solves this: an async-first, zero-boilerplate authentication and account management engine built natively for **FastAPI**, **Pydantic v2**, and **Async SQLAlchemy 2.0**.
+**FastAPI Accounts** aims to provide a zero-boilerplate authentication and account management engine built for **FastAPI**, **Pydantic v2**, and **Async SQLAlchemy 2.0**.
 
 📖 *Read our full story: [**The Journey of FastAPI Accounts (JOURNEY.md)**](JOURNEY.md).*
 
@@ -30,7 +30,7 @@ Today, building authentication in FastAPI usually means either:
 
 ## ✨ Key Capabilities
 
-* **⚡ 15-Line Setup:** Complete authentication and account lifecycle mounted with a single router and sensible defaults.
+* **⚡ Minimal Setup:** Core authentication and account endpoints mounted with a single router and sensible defaults.
 * **🍪 Dual-Transport Architecture:**
   * **Cookie Transport (Web & SPAs):** `HttpOnly` `SameSite=Lax` session cookies.
   * **Bearer Transport (Mobile & CLI):** `Authorization: Bearer <token>` token transport.
@@ -42,7 +42,7 @@ Today, building authentication in FastAPI usually means either:
   * **Sanitized Logging:** Zero raw security tokens or credential material in stdout/stderr/logs.
 * **🗄️ Database & Schema Management:**
   * Async SQLAlchemy 2.0 with type-annotated declarative mixins.
-  * Included Alembic migrations with expand/backfill/constrain upgrade paths.
+  * Packaged Alembic migrations for default models with expand/backfill/constrain upgrade paths.
 
 ---
 
@@ -70,7 +70,7 @@ from fastapi import Depends, FastAPI
 from fastapi_accounts import FastAPIAccounts, SQLAlchemyAdapter
 
 # 1. Initialize adapter & account engine
-# In production, provide a cryptographically random secret (>= 32 chars / 256 bits):
+# In production, provide a cryptographically secure secret (minimum 32 characters):
 # $ export FASTAPI_ACCOUNTS_SECRET_KEY=$(openssl rand -hex 32)
 adapter = SQLAlchemyAdapter(database_url="sqlite+aiosqlite:///./accounts.db")
 accounts = FastAPIAccounts(
@@ -104,7 +104,7 @@ async def get_profile(user=Depends(accounts.current_active_user)):
 
 ## 🗄️ Database Migrations & Legacy Adoption
 
-FastAPI Accounts ships with production-ready Alembic migrations.
+FastAPI Accounts includes packaged Alembic migrations for its default declarative models.
 
 ### Programmatic Migration Execution
 
