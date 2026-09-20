@@ -52,6 +52,7 @@ async def test_password_reset_flow_e2e(cookie_accounts: FastAPIAccounts):
                 session, "charlie@example.com"
             )
             assert user is not None
+            assert user.password_credential is not None
             reset_token = cookie_accounts.generate_password_reset_token(
                 user.id,
                 "charlie@example.com",

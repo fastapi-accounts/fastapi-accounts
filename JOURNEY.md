@@ -83,16 +83,19 @@ from fastapi_accounts import FastAPIAccounts, SQLAlchemyAdapter
 adapter = SQLAlchemyAdapter(database_url="sqlite+aiosqlite:///./accounts.db")
 accounts = FastAPIAccounts(adapter=adapter, secret_key="env:AUTH_SECRET_KEY")
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await adapter.create_all()
     yield
 
+
 app = FastAPI(title="My API", lifespan=lifespan)
 app.include_router(accounts.router, prefix="/api/v1/auth")
 
+
 @app.get("/me")
-async def get_me(user = Depends(accounts.current_active_user)):
+async def get_me(user=Depends(accounts.current_active_user)):
     return {"email": user.primary_email}
 ```
 

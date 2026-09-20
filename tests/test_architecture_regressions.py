@@ -1,6 +1,8 @@
 import pytest
 from fastapi import Depends, FastAPI
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from fastapi_accounts.core import FastAPIAccounts
 from fastapi_accounts.models.default import User
@@ -29,6 +31,51 @@ async def test_a01_commit_before_response_guarantee(cookie_accounts: FastAPIAcco
             assert user is not None
             assert user.primary_email == "a01_commit@example.com"
             assert user.password_credential is not None
+
+
+@pytest.mark.asyncio
+async def test_a01_injected_commit_failure_prevents_201_response(
+    cookie_accounts: FastAPIAccounts, monkeypatch: pytest.MonkeyPatch
+):
+    """A01: Injected commit failure must abort request, prevent 201 response, and suppress side-effects."""
+    app = FastAPI()
+    app.include_router(cookie_accounts.router, prefix="/api/v1/auth")
+
+    dispatched: list[str] = []
+
+    async def mock_callback(user, token):
+        dispatched.append(user.primary_email)
+
+    cookie_accounts.on_after_register = mock_callback
+
+    original_commit = AsyncSession.commit
+
+    async def failing_commit(self):
+        raise SQLAlchemyError("Simulated database failure during commit")
+
+    monkeypatch.setattr(AsyncSession, "commit", failing_commit)
+
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/api/v1/auth/register",
+            json={"email": "a01_fail@example.com", "password": "FailPassword123!"},
+        )
+        # Must return 500 Internal Server Error, NEVER 201 Created
+        assert resp.status_code == 500
+
+    # Restore commit to query database with a clean session
+    monkeypatch.setattr(AsyncSession, "commit", original_commit)
+
+    # Invariant: No side-effect email dispatch was called
+    assert len(dispatched) == 0
+
+    # Invariant: User was NOT persisted in the database
+    async with cookie_accounts.adapter.session_maker() as session:
+        user = await cookie_accounts.adapter.get_user_by_email(
+            session, "a01_fail@example.com"
+        )
+        assert user is None
 
 
 @pytest.mark.asyncio

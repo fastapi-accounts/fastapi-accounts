@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from fastapi_accounts.adapters.sqlalchemy import SQLAlchemyAdapter
@@ -191,6 +192,19 @@ class FastAPIAccounts:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)
                 )
+            except IntegrityError:
+                await db.rollback()
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="User with this email already exists.",
+                )
+            except SQLAlchemyError as e:
+                await db.rollback()
+                logger.error(f"Database error during registration: {e}")
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Database error during registration.",
+                )
 
             verification_token = self.generate_email_verification_token(
                 email_record.email
@@ -265,14 +279,16 @@ class FastAPIAccounts:
             user = await self.adapter.get_user_by_email(db, payload.email)
             if user and user.is_active:
                 cred = await self.adapter.get_password_credential(db, user.id)
-                pwd_ts = _get_pwd_state_ts(
-                    cred.password_updated_at
-                    if cred
-                    else (
-                        getattr(user, "password_credential", None)
-                        and user.password_credential.password_updated_at
-                    )
-                )
+                user_cred = getattr(user, "password_credential", None)
+                if cred is not None and cred.password_updated_at is not None:
+                    pwd_ts = _get_pwd_state_ts(cred.password_updated_at)
+                elif (
+                    user_cred is not None
+                    and getattr(user_cred, "password_updated_at", None) is not None
+                ):
+                    pwd_ts = _get_pwd_state_ts(user_cred.password_updated_at)
+                else:
+                    pwd_ts = 0
                 token = self.generate_password_reset_token(
                     user.id, payload.email, pwd_ts=pwd_ts
                 )
@@ -315,8 +331,13 @@ class FastAPIAccounts:
 
             current_pwd_ts = _get_pwd_state_ts(cred.password_updated_at)
             token_pwd_ts = token_data.get("pwd_ts")
-            # Enforce single-use: token must match current password timestamp
-            if token_pwd_ts is not None and token_pwd_ts != current_pwd_ts:
+            # Enforce single-use: token must contain integer pwd_ts matching current password timestamp (fail closed)
+            if (
+                token_pwd_ts is None
+                or not isinstance(token_pwd_ts, int)
+                or token_pwd_ts == 0
+                or token_pwd_ts != current_pwd_ts
+            ):
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="Invalid or expired password reset token.",

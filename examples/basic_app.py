@@ -6,7 +6,10 @@ from fastapi_accounts import FastAPIAccounts, SQLAlchemyAdapter
 
 # 1. Initialize the adapter and account engine
 adapter = SQLAlchemyAdapter(database_url="sqlite+aiosqlite:///./example_accounts.db")
-accounts = FastAPIAccounts(adapter=adapter, secret_key="super-secret-key-change-me")
+accounts = FastAPIAccounts(
+    adapter=adapter,
+    secret_key="super-secret-key-must-be-at-least-32-chars-long-1234567890",
+)
 
 
 @asynccontextmanager
@@ -18,7 +21,9 @@ async def lifespan(app: FastAPI):
 
 # 2. Create FastAPI application and mount the auth router
 app = FastAPI(title="FastAPI Accounts Demo", lifespan=lifespan)
-app.include_router(accounts.router, prefix="/api/v1/auth", tags=["Authentication & Accounts"])
+app.include_router(
+    accounts.router, prefix="/api/v1/auth", tags=["Authentication & Accounts"]
+)
 
 
 # 3. Protect any endpoint with clean dependency injection

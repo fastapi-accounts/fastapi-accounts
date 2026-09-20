@@ -2,7 +2,7 @@ import uuid
 from collections.abc import AsyncGenerator
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import delete, select
+from sqlalchemy import CursorResult, delete, select
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -231,7 +231,12 @@ class SQLAlchemyAdapter:
         token_id = hash_token(raw_token)
         stmt = delete(self.session_model).where(self.session_model.id == token_id)
         result = await session.execute(stmt)
-        return (result.rowcount or 0) > 0
+        count = (
+            result.rowcount
+            if isinstance(result, CursorResult)
+            else (getattr(result, "rowcount", 0) or 0)
+        )
+        return count > 0
 
     async def revoke_all_user_sessions(
         self, session: AsyncSession, user_id: uuid.UUID
@@ -239,7 +244,12 @@ class SQLAlchemyAdapter:
         """Delete all active sessions for a user."""
         stmt = delete(self.session_model).where(self.session_model.user_id == user_id)
         result = await session.execute(stmt)
-        return result.rowcount or 0
+        count = (
+            result.rowcount
+            if isinstance(result, CursorResult)
+            else (getattr(result, "rowcount", 0) or 0)
+        )
+        return int(count)
 
     async def update_user_password(
         self, session: AsyncSession, user_id: uuid.UUID, new_password: str
@@ -300,4 +310,9 @@ class SQLAlchemyAdapter:
             self.session_model.id != current_token_id,
         )
         result = await session.execute(stmt)
-        return result.rowcount or 0
+        count = (
+            result.rowcount
+            if isinstance(result, CursorResult)
+            else (getattr(result, "rowcount", 0) or 0)
+        )
+        return int(count)

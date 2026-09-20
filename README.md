@@ -51,9 +51,13 @@ Today, building authentication in FastAPI usually means either:
 ### 1. Installation
 
 ```bash
-pip install fastapi-accounts --pre
+# Core package with SQLite async driver for quickstart:
+pip install "fastapi-accounts[dev]" --pre
+# or:
+pip install fastapi-accounts aiosqlite --pre
 # or with uv:
 uv add fastapi-accounts --prerelease=allow
+uv add aiosqlite
 ```
 
 ### 2. Basic Application (`app.py`)
@@ -65,7 +69,11 @@ from fastapi_accounts import FastAPIAccounts, SQLAlchemyAdapter
 
 # 1. Initialize the adapter and account engine
 adapter = SQLAlchemyAdapter(database_url="sqlite+aiosqlite:///./accounts.db")
-accounts = FastAPIAccounts(adapter=adapter, secret_key="super-secret-key-change-me")
+accounts = FastAPIAccounts(
+    adapter=adapter,
+    secret_key="super-secret-key-must-be-at-least-32-chars-long-1234567890",
+)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -73,13 +81,15 @@ async def lifespan(app: FastAPI):
     await adapter.create_all()
     yield
 
+
 # 2. Mount all auth & account endpoints in one line
 app = FastAPI(title="My API", lifespan=lifespan)
 app.include_router(accounts.router, prefix="/api/v1/auth", tags=["Auth"])
 
+
 # 3. Protect any endpoint with clean dependency injection
 @app.get("/api/v1/profile")
-async def get_profile(user = Depends(accounts.current_active_user)):
+async def get_profile(user=Depends(accounts.current_active_user)):
     return {"message": f"Welcome back, {user.primary_email}!", "user_id": user.id}
 ```
 

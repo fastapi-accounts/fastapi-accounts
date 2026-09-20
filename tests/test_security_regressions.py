@@ -1,3 +1,4 @@
+import logging
 import os
 
 import pytest
@@ -6,6 +7,7 @@ from httpx import ASGITransport, AsyncClient
 
 from fastapi_accounts.adapters.sqlalchemy import SQLAlchemyAdapter
 from fastapi_accounts.core import FastAPIAccounts
+from fastapi_accounts.transports.cookie import CookieTransport
 
 
 @pytest.mark.asyncio
@@ -29,19 +31,19 @@ async def test_s1_password_reset_token_single_use(cookie_accounts: FastAPIAccoun
             json={"email": "s1_replay@example.com"},
         )
 
-        user = await cookie_accounts.adapter.get_user_by_email(
-            await cookie_accounts.adapter.session_maker().__aenter__(),
-            "s1_replay@example.com",
-        )
-        assert user is not None
-        cred = await cookie_accounts.adapter.get_password_credential(
-            await cookie_accounts.adapter.session_maker().__aenter__(), user.id
-        )
-        assert cred is not None
+        async with cookie_accounts.adapter.session_maker() as session:
+            user = await cookie_accounts.adapter.get_user_by_email(
+                session, "s1_replay@example.com"
+            )
+            assert user is not None
+            cred = await cookie_accounts.adapter.get_password_credential(
+                session, user.id
+            )
+            assert cred is not None
 
-        reset_token = cookie_accounts.generate_password_reset_token(
-            user.id, "s1_replay@example.com", pwd_ts=cred.password_updated_at
-        )
+            reset_token = cookie_accounts.generate_password_reset_token(
+                user.id, "s1_replay@example.com", pwd_ts=cred.password_updated_at
+            )
 
         # First use: must SUCCEED
         resp1 = await client.post(
@@ -81,20 +83,20 @@ async def test_s1_password_reset_token_invalidated_by_password_change(
         )
         assert login_resp.status_code == 200
 
-        user = await cookie_accounts.adapter.get_user_by_email(
-            await cookie_accounts.adapter.session_maker().__aenter__(),
-            "s1_inval@example.com",
-        )
-        assert user is not None
-        cred = await cookie_accounts.adapter.get_password_credential(
-            await cookie_accounts.adapter.session_maker().__aenter__(), user.id
-        )
-        assert cred is not None
+        async with cookie_accounts.adapter.session_maker() as session:
+            user = await cookie_accounts.adapter.get_user_by_email(
+                session, "s1_inval@example.com"
+            )
+            assert user is not None
+            cred = await cookie_accounts.adapter.get_password_credential(
+                session, user.id
+            )
+            assert cred is not None
 
-        # Generate a reset token before changing password
-        reset_token = cookie_accounts.generate_password_reset_token(
-            user.id, "s1_inval@example.com", pwd_ts=cred.password_updated_at
-        )
+            # Generate a reset token before changing password
+            reset_token = cookie_accounts.generate_password_reset_token(
+                user.id, "s1_inval@example.com", pwd_ts=cred.password_updated_at
+            )
 
         # User changes password via /change-password
         change_resp = await client.post(
@@ -113,6 +115,87 @@ async def test_s1_password_reset_token_invalidated_by_password_change(
         )
         assert reset_resp.status_code == 400
         assert "Invalid or expired" in reset_resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_s1_legacy_token_without_pwd_ts_rejected_fail_closed(
+    cookie_accounts: FastAPIAccounts,
+):
+    """S1: Signed tokens missing pwd_ts (e.g. from legacy v0.1.0a2 releases) must FAIL CLOSED."""
+    app = FastAPI()
+    app.include_router(cookie_accounts.router, prefix="/api/v1/auth")
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # Register user
+        reg_resp = await client.post(
+            "/api/v1/auth/register",
+            json={"email": "s1_legacy@example.com", "password": "LegacyPassword123!"},
+        )
+        assert reg_resp.status_code == 201
+
+        async with cookie_accounts.adapter.session_maker() as session:
+            user = await cookie_accounts.adapter.get_user_by_email(
+                session, "s1_legacy@example.com"
+            )
+            assert user is not None
+
+        # Forge a signed token in legacy format without pwd_ts claim
+        legacy_token = cookie_accounts.token_signer.create_token(
+            {
+                "sub": str(user.id),
+                "email": "s1_legacy@example.com",
+                "action": "reset_password",
+            },
+            max_age_seconds=900,
+        )
+
+        # Attempt redemption: MUST fail closed with 400
+        resp = await client.post(
+            "/api/v1/auth/reset-password",
+            json={"token": legacy_token, "new_password": "NewLegacyPassword456!"},
+        )
+        assert resp.status_code == 400
+        assert "Invalid or expired" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_s1_tampered_or_invalid_pwd_ts_rejected_fail_closed(
+    cookie_accounts: FastAPIAccounts,
+):
+    """S1: Tokens with non-integer or zero pwd_ts must FAIL CLOSED."""
+    app = FastAPI()
+    app.include_router(cookie_accounts.router, prefix="/api/v1/auth")
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        await client.post(
+            "/api/v1/auth/register",
+            json={"email": "s1_tamper@example.com", "password": "TamperPassword123!"},
+        )
+
+        async with cookie_accounts.adapter.session_maker() as session:
+            user = await cookie_accounts.adapter.get_user_by_email(
+                session, "s1_tamper@example.com"
+            )
+            assert user is not None
+
+        for bad_pwd_ts in [0, -1, "invalid_str", None, 999999]:
+            token = cookie_accounts.token_signer.create_token(
+                {
+                    "sub": str(user.id),
+                    "email": "s1_tamper@example.com",
+                    "action": "reset_password",
+                    "pwd_ts": bad_pwd_ts,
+                },
+                max_age_seconds=900,
+            )
+            resp = await client.post(
+                "/api/v1/auth/reset-password",
+                json={"token": token, "new_password": "NewTamperPassword456!"},
+            )
+            assert resp.status_code == 400
+            assert "Invalid or expired" in resp.json()["detail"]
 
 
 @pytest.mark.asyncio
@@ -168,37 +251,72 @@ async def test_s2_login_response_dto_whitelisting(
 
 
 @pytest.mark.asyncio
-async def test_s3_no_raw_tokens_in_stdout(
-    cookie_accounts: FastAPIAccounts, capsys: pytest.CaptureFixture
+async def test_s3_no_raw_tokens_in_stdout_or_logs(
+    adapter: SQLAlchemyAdapter,
+    capsys: pytest.CaptureFixture,
+    caplog: pytest.LogCaptureFixture,
 ):
-    """S3: Ensure raw security tokens are never printed to server stdout/stderr."""
+    """S3: Ensure raw security tokens are never leaked to stdout, stderr, or loggers."""
+    dispatched_verification_tokens: list[str] = []
+    dispatched_reset_tokens: list[str] = []
+
+    async def on_register(user, token):
+        dispatched_verification_tokens.append(token)
+
+    async def on_reset(user, token):
+        dispatched_reset_tokens.append(token)
+
+    accounts = FastAPIAccounts(
+        adapter=adapter,
+        secret_key="a" * 32,
+        transport=CookieTransport(),
+        debug=True,
+        on_after_register=on_register,
+        on_after_request_password_reset=on_reset,
+    )
+
     app = FastAPI()
-    app.include_router(cookie_accounts.router, prefix="/api/v1/auth")
+    app.include_router(accounts.router, prefix="/api/v1/auth")
 
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        # Register user
-        reg_resp = await client.post(
-            "/api/v1/auth/register",
-            json={"email": "s3_stdout@example.com", "password": "StdoutPassword123!"},
-        )
-        assert reg_resp.status_code == 201
+    with caplog.at_level(logging.DEBUG):
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            # 1. Register user
+            reg_resp = await client.post(
+                "/api/v1/auth/register",
+                json={"email": "s3_audit@example.com", "password": "AuditPassword123!"},
+            )
+            assert reg_resp.status_code == 201
 
-        # Request password reset
-        req_resp = await client.post(
-            "/api/v1/auth/request-password-reset",
-            json={"email": "s3_stdout@example.com"},
-        )
-        assert req_resp.status_code == 200
+            # 2. Request password reset
+            req_resp = await client.post(
+                "/api/v1/auth/request-password-reset",
+                json={"email": "s3_audit@example.com"},
+            )
+            assert req_resp.status_code == 200
 
-        captured = capsys.readouterr()
-        # Verify no raw token or link was printed to stdout
-        assert "Verification link for" not in captured.out
-        assert "Password reset link for" not in captured.out
+    assert len(dispatched_verification_tokens) == 1
+    assert len(dispatched_reset_tokens) == 1
+    v_token = dispatched_verification_tokens[0]
+    r_token = dispatched_reset_tokens[0]
+
+    captured = capsys.readouterr()
+    stdout_all = captured.out + captured.err
+    log_all = caplog.text
+
+    # Complete raw tokens MUST NEVER be present in stdout, stderr, or logs
+    assert v_token not in stdout_all
+    assert v_token not in log_all
+    assert r_token not in stdout_all
+    assert r_token not in log_all
+
+    # Sensitive link texts from older versions must not exist
+    assert "Verification link for" not in stdout_all
+    assert "Password reset link for" not in stdout_all
 
 
 def test_s4_secret_key_length_validation(adapter: SQLAlchemyAdapter):
-    """S4: FastAPIAccounts must enforce at least 32-character (256-bit) secret keys at initialization."""
+    """S4: FastAPIAccounts must enforce at least 32-character secret keys at initialization."""
     # 1. Empty string
     with pytest.raises(ValueError, match="at least 32 characters"):
         FastAPIAccounts(adapter=adapter, secret_key="")

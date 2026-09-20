@@ -43,13 +43,14 @@ dev = [
     "aiosqlite>=0.20.0",
     "ruff>=0.3.0",
     "mypy>=1.9.0",
+    "alembic>=1.13.0",
 ]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/fastapi_accounts"]
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
+pythonpath = ["src", "."]
 asyncio_mode = "auto"
 
 [tool.ruff.lint]
