@@ -4,28 +4,35 @@ import uuid
 from datetime import datetime, timezone
 
 import pytest
+import sqlalchemy as sa
 from alembic import command
-from alembic.config import Config
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import OperationalError
 
 from fastapi_accounts.adapters.sqlalchemy import SQLAlchemyAdapter
+from fastapi_accounts.migrations import (
+    get_alembic_config,
+    inspect_legacy_schema,
+)
+from fastapi_accounts.models.default import Base
 
 
 @pytest.mark.asyncio
 async def test_migration_fresh_database():
-    """Test initializing a completely fresh database with alembic upgrade head."""
+    """Test initializing a completely fresh database with alembic upgrade head and assert 0 drift."""
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = os.path.join(tmpdir, "fresh_test.db")
         sync_db_url = f"sqlite:///{db_path}"
         async_db_url = f"sqlite+aiosqlite:///{db_path}"
 
-        # 1. Run Alembic upgrade head on an empty database
-        alembic_cfg = Config("alembic.ini")
-        alembic_cfg.set_main_option("sqlalchemy.url", sync_db_url)
+        # 1. Run Alembic upgrade head on an empty database using package config helper
+        alembic_cfg = get_alembic_config(sync_db_url)
         command.upgrade(alembic_cfg, "head")
 
-        # 2. Verify tables and operations work cleanly with SQLAlchemyAdapter
+        # 2. Assert zero schema drift
+        command.check(alembic_cfg)
+
+        # 3. Verify tables and operations work cleanly with SQLAlchemyAdapter
         adapter = SQLAlchemyAdapter(database_url=async_db_url)
         async with adapter.session_maker() as session:
             _user, _email_rec = await adapter.create_user_with_password(
@@ -47,128 +54,277 @@ async def test_migration_fresh_database():
 
 
 @pytest.mark.asyncio
-async def test_migration_upgrade_from_legacy_schema():
-    """Test upgrade from legacy v0.1.0a2 schema without password_updated_at column to v0.1.0a3+."""
+async def test_migration_upgrade_from_legacy_a2_schema():
+    """Test upgrade from authentic v0.1.0a2 create_all() schema (including existing indexes) to head."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        db_path = os.path.join(tmpdir, "legacy_test.db")
+        db_path = os.path.join(tmpdir, "legacy_a2_test.db")
         sync_db_url = f"sqlite:///{db_path}"
         async_db_url = f"sqlite+aiosqlite:///{db_path}"
 
-        # 1. Create legacy schema (v0.1.0a2) directly using SQLite sync engine
         sync_engine = create_engine(sync_db_url)
-        with sync_engine.connect() as conn:
-            # Create users table
-            conn.execute(
-                text(
-                    """
-                CREATE TABLE users (
-                    id CHAR(36) PRIMARY KEY,
-                    is_active BOOLEAN NOT NULL DEFAULT 1,
-                    is_superuser BOOLEAN NOT NULL DEFAULT 0,
-                    created_at TIMESTAMP NOT NULL,
-                    updated_at TIMESTAMP NOT NULL
-                )
-            """
-                )
-            )
-            # Create email_addresses table
-            conn.execute(
-                text(
-                    """
-                CREATE TABLE email_addresses (
-                    id CHAR(36) PRIMARY KEY,
-                    user_id CHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                    email VARCHAR(320) NOT NULL UNIQUE,
-                    is_verified BOOLEAN NOT NULL DEFAULT 0,
-                    is_primary BOOLEAN NOT NULL DEFAULT 1,
-                    created_at TIMESTAMP NOT NULL,
-                    updated_at TIMESTAMP NOT NULL
-                )
-            """
-                )
-            )
-            # Create legacy password_credentials table WITHOUT password_updated_at
-            conn.execute(
-                text(
-                    """
-                CREATE TABLE password_credentials (
-                    id CHAR(36) PRIMARY KEY,
-                    user_id CHAR(36) NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
-                    hashed_password VARCHAR(255) NOT NULL,
-                    created_at TIMESTAMP NOT NULL,
-                    updated_at TIMESTAMP NOT NULL
-                )
-            """
-                )
-            )
-            # Create sessions table
-            conn.execute(
-                text(
-                    """
-                CREATE TABLE sessions (
-                    id VARCHAR(64) PRIMARY KEY,
-                    user_id CHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                    created_at TIMESTAMP NOT NULL,
-                    expires_at TIMESTAMP NOT NULL,
-                    ip_address VARCHAR(45),
-                    user_agent VARCHAR(512)
-                )
-            """
-                )
-            )
 
+        # 1. Create authentic v0.1.0a2 schema (as created by v0.1.0a2 adapter.create_all())
+        meta_a2 = sa.MetaData()
+        users_t = sa.Table(
+            "users",
+            meta_a2,
+            sa.Column("id", sa.Uuid(), primary_key=True),
+            sa.Column(
+                "is_active", sa.Boolean(), nullable=False, server_default=sa.true()
+            ),
+            sa.Column(
+                "is_superuser", sa.Boolean(), nullable=False, server_default=sa.false()
+            ),
+            sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+            sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+        )
+        emails_t = sa.Table(
+            "email_addresses",
+            meta_a2,
+            sa.Column("id", sa.Uuid(), primary_key=True),
+            sa.Column(
+                "user_id",
+                sa.Uuid(),
+                sa.ForeignKey("users.id", ondelete="CASCADE"),
+                nullable=False,
+                index=True,
+            ),
+            sa.Column("email", sa.String(320), nullable=False, unique=True, index=True),
+            sa.Column(
+                "is_verified", sa.Boolean(), nullable=False, server_default=sa.false()
+            ),
+            sa.Column(
+                "is_primary", sa.Boolean(), nullable=False, server_default=sa.false()
+            ),
+            sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        )
+        creds_t = sa.Table(
+            "password_credentials",
+            meta_a2,
+            sa.Column("id", sa.Uuid(), primary_key=True),
+            sa.Column(
+                "user_id",
+                sa.Uuid(),
+                sa.ForeignKey("users.id", ondelete="CASCADE"),
+                nullable=False,
+                unique=True,
+                index=True,
+            ),
+            sa.Column("hashed_password", sa.String(1024), nullable=False),
+            sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+            sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+        )
+        sa.Table(
+            "sessions",
+            meta_a2,
+            sa.Column("id", sa.String(64), primary_key=True),
+            sa.Column(
+                "user_id",
+                sa.Uuid(),
+                sa.ForeignKey("users.id", ondelete="CASCADE"),
+                nullable=False,
+                index=True,
+            ),
+            sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+            sa.Column(
+                "expires_at", sa.DateTime(timezone=True), nullable=False, index=True
+            ),
+            sa.Column("ip_address", sa.String(45), nullable=True),
+            sa.Column("user_agent", sa.String(512), nullable=True),
+        )
+
+        meta_a2.create_all(sync_engine)
+
+        user_id = uuid.uuid4()
+        now = datetime.now(timezone.utc)
+        with sync_engine.connect() as conn:
             # Insert legacy user record
-            now_iso = datetime.now(timezone.utc).isoformat()
-            user_id = "11111111111111111111111111111111"
             conn.execute(
-                text(
-                    """
-                INSERT INTO users (id, is_active, is_superuser, created_at, updated_at)
-                VALUES (:id, 1, 0, :now, :now)
-            """
-                ),
-                {"id": user_id, "now": now_iso},
+                users_t.insert().values(
+                    id=user_id,
+                    is_active=True,
+                    is_superuser=False,
+                    created_at=now,
+                    updated_at=now,
+                )
             )
             conn.execute(
-                text(
-                    """
-                INSERT INTO email_addresses (id, user_id, email, is_verified, is_primary, created_at, updated_at)
-                VALUES ('22222222222222222222222222222222', :user_id, 'legacy@example.com', 1, 1, :now, :now)
-            """
-                ),
-                {"user_id": user_id, "now": now_iso},
+                emails_t.insert().values(
+                    id=uuid.uuid4(),
+                    user_id=user_id,
+                    email="legacy_a2@example.com",
+                    is_verified=True,
+                    is_primary=True,
+                    created_at=now,
+                )
             )
             conn.execute(
-                text(
-                    """
-                INSERT INTO password_credentials (id, user_id, hashed_password, created_at, updated_at)
-                VALUES ('33333333333333333333333333333333', :user_id, '$argon2id$mockhash', :now, :now)
-            """
-                ),
-                {"user_id": user_id, "now": now_iso},
+                creds_t.insert().values(
+                    id=uuid.uuid4(),
+                    user_id=user_id,
+                    hashed_password="$argon2id$mockhash",
+                    created_at=now,
+                    updated_at=now,
+                )
             )
             conn.commit()
 
-        # 2. Before migration: querying with current model raises OperationalError (missing password_updated_at)
+            # Verify schema inspector identifies v0.1.0a2
+            classification = inspect_legacy_schema(conn)
+            assert classification == "v0.1.0a2"
+
+        # 2. Before migration: querying with current model raises OperationalError
         adapter_pre = SQLAlchemyAdapter(database_url=async_db_url)
         with pytest.raises(OperationalError, match="no such column"):
             async with adapter_pre.session_maker() as session:
-                await adapter_pre.get_password_credential(session, uuid.UUID(user_id))
+                await adapter_pre.get_password_credential(session, user_id)
         await adapter_pre.engine.dispose()
 
-        # 3. Stamp 0001_initial_schema and run Alembic Upgrade to head (0002_add_password_updated_at)
-        alembic_cfg = Config("alembic.ini")
-        alembic_cfg.set_main_option("sqlalchemy.url", sync_db_url)
+        # 3. Stamp 0001_initial_schema and run Alembic upgrade head
+        alembic_cfg = get_alembic_config(sync_db_url)
         command.stamp(alembic_cfg, "0001_initial_schema")
         command.upgrade(alembic_cfg, "head")
 
-        # 4. Post migration: verify column exists and adapter queries successfully without OperationalError
+        # 4. Assert zero schema drift after legacy upgrade
+        command.check(alembic_cfg)
+
+        # 5. Post migration: verify adapter queries successfully
         adapter_post = SQLAlchemyAdapter(database_url=async_db_url)
         async with adapter_post.session_maker() as session:
-            user = await adapter_post.get_user_by_email(session, "legacy@example.com")
+            user = await adapter_post.get_user_by_email(
+                session, "legacy_a2@example.com"
+            )
             assert user is not None
             assert user.password_credential is not None
-            # Verify password_updated_at is populated
             assert user.password_credential.password_updated_at is not None
 
         await adapter_post.engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_migration_adopt_legacy_a3_schema():
+    """Test adopting authentic v0.1.0a3 create_all() schema (with password_updated_at) to head."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = os.path.join(tmpdir, "legacy_a3_test.db")
+        sync_db_url = f"sqlite:///{db_path}"
+        sync_engine = create_engine(sync_db_url)
+
+        # 1. Create authentic v0.1.0a3 schema via Base.metadata.create_all()
+        Base.metadata.create_all(sync_engine)
+
+        with sync_engine.connect() as conn:
+            # Verify schema inspector identifies v0.1.0a3
+            classification = inspect_legacy_schema(conn)
+            assert classification == "v0.1.0a3"
+
+        # 2. Stamp head directly for v0.1.0a3 schemas
+        alembic_cfg = get_alembic_config(sync_db_url)
+        command.stamp(alembic_cfg, "head")
+
+        # 3. Assert zero schema drift
+        command.check(alembic_cfg)
+
+
+@pytest.mark.asyncio
+async def test_migration_upgrade_from_0002():
+    """Test upgrading an Alembic-managed database from 0002 to head adds missing indexes cleanly."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = os.path.join(tmpdir, "upgrade_0002_test.db")
+        sync_db_url = f"sqlite:///{db_path}"
+
+        alembic_cfg = get_alembic_config(sync_db_url)
+        # Apply up to 0002
+        command.upgrade(alembic_cfg, "0002_add_password_updated_at")
+
+        # Verify sessions indexes are currently absent
+        sync_engine = create_engine(sync_db_url)
+        with sync_engine.connect() as conn:
+            inspector = sa.inspect(conn)
+            indexes = {idx["name"] for idx in inspector.get_indexes("sessions")}
+            assert "ix_sessions_user_id" not in indexes
+            assert "ix_sessions_expires_at" not in indexes
+
+        # Upgrade to head (0003)
+        command.upgrade(alembic_cfg, "head")
+
+        # Verify indexes are created and zero drift exists
+        with sync_engine.connect() as conn:
+            inspector = sa.inspect(conn)
+            indexes = {idx["name"] for idx in inspector.get_indexes("sessions")}
+            assert "ix_sessions_user_id" in indexes
+            assert "ix_sessions_expires_at" in indexes
+
+        command.check(alembic_cfg)
+
+
+def test_migration_downgrade_and_reupgrade():
+    """Test migration reversibility: upgrade head -> downgrade 0002 -> upgrade head -> downgrade base -> upgrade head."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = os.path.join(tmpdir, "reversibility_test.db")
+        sync_db_url = f"sqlite:///{db_path}"
+
+        alembic_cfg = get_alembic_config(sync_db_url)
+
+        # 1. Upgrade to head
+        command.upgrade(alembic_cfg, "head")
+        command.check(alembic_cfg)
+
+        # 2. Downgrade to 0002
+        command.downgrade(alembic_cfg, "0002_add_password_updated_at")
+
+        # 3. Upgrade back to head
+        command.upgrade(alembic_cfg, "head")
+        command.check(alembic_cfg)
+
+        # 4. Downgrade to base
+        command.downgrade(alembic_cfg, "base")
+
+        # 5. Upgrade back to head
+        command.upgrade(alembic_cfg, "head")
+        command.check(alembic_cfg)
+
+
+def test_inspect_legacy_schema_outcomes():
+    """Test inspect_legacy_schema across valid and invalid schema states."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = os.path.join(tmpdir, "inspect_test.db")
+        sync_db_url = f"sqlite:///{db_path}"
+        engine = create_engine(sync_db_url)
+
+        # 1. Empty database -> unrecognized
+        with engine.connect() as conn:
+            assert inspect_legacy_schema(conn) == "unrecognized"
+
+        # 2. Partial tables (only users table) -> unrecognized
+        with engine.connect() as conn:
+            conn.execute(
+                text(
+                    "CREATE TABLE users (id CHAR(36) PRIMARY KEY, is_active BOOLEAN NOT NULL DEFAULT 1, is_superuser BOOLEAN NOT NULL DEFAULT 0, created_at TIMESTAMP NOT NULL, updated_at TIMESTAMP NOT NULL)"
+                )
+            )
+            conn.commit()
+            assert inspect_legacy_schema(conn) == "unrecognized"
+
+        # 3. Corrupt table (users table missing updated_at) -> unrecognized
+        with engine.connect() as conn:
+            conn.execute(text("DROP TABLE users"))
+            conn.execute(
+                text("CREATE TABLE users (id CHAR(36) PRIMARY KEY, is_active BOOLEAN)")
+            )
+            conn.execute(text("CREATE TABLE email_addresses (id CHAR(36) PRIMARY KEY)"))
+            conn.execute(
+                text("CREATE TABLE password_credentials (id CHAR(36) PRIMARY KEY)")
+            )
+            conn.execute(text("CREATE TABLE sessions (id VARCHAR(64) PRIMARY KEY)"))
+            conn.commit()
+            assert inspect_legacy_schema(conn) == "unrecognized"
+
+
+def test_get_alembic_config_helper_percent_escaping():
+    """Test get_alembic_config handles percent-encoded database URLs without ConfigParser interpolation error."""
+    test_url = "postgresql+asyncpg://user:p%25ss@localhost:5432/test_db%25"
+    config = get_alembic_config(test_url)
+
+    # get_main_option should return unescaped URL
+    retrieved_url = config.get_main_option("sqlalchemy.url")
+    assert retrieved_url == test_url

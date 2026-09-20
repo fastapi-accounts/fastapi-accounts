@@ -1,11 +1,12 @@
 import pytest
 from fastapi import Depends, FastAPI
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from fastapi_accounts.core import FastAPIAccounts
-from fastapi_accounts.models.default import User
+from fastapi_accounts.core import FastAPIAccounts, _get_pwd_state_ts
+from fastapi_accounts.models.default import EmailAddress, Session, User
 
 
 @pytest.mark.asyncio
@@ -37,7 +38,7 @@ async def test_a01_commit_before_response_guarantee(cookie_accounts: FastAPIAcco
 async def test_a01_injected_commit_failure_prevents_201_response(
     cookie_accounts: FastAPIAccounts, monkeypatch: pytest.MonkeyPatch
 ):
-    """A01: Injected commit failure must abort request, prevent 201 response, and suppress side-effects."""
+    """A01: Injected commit failure must abort registration, return 500, and suppress side-effects."""
     app = FastAPI()
     app.include_router(cookie_accounts.router, prefix="/api/v1/auth")
 
@@ -76,6 +77,336 @@ async def test_a01_injected_commit_failure_prevents_201_response(
             session, "a01_fail@example.com"
         )
         assert user is None
+
+
+@pytest.mark.asyncio
+async def test_a01_injected_commit_failure_verify_email(
+    cookie_accounts: FastAPIAccounts, monkeypatch: pytest.MonkeyPatch
+):
+    """A01: Injected commit failure during email verification must return 500 and leave email unverified."""
+    app = FastAPI()
+    app.include_router(cookie_accounts.router, prefix="/api/v1/auth")
+
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # Create unverified user
+        reg_resp = await client.post(
+            "/api/v1/auth/register",
+            json={"email": "unverified@example.com", "password": "SecurePassword123!"},
+        )
+        assert reg_resp.status_code == 201
+
+        token = cookie_accounts.generate_email_verification_token(
+            "unverified@example.com"
+        )
+
+        # Inject commit failure
+        original_commit = AsyncSession.commit
+
+        async def failing_commit(self):
+            raise SQLAlchemyError("Simulated database failure during verify commit")
+
+        monkeypatch.setattr(AsyncSession, "commit", failing_commit)
+
+        verify_resp = await client.post(
+            "/api/v1/auth/verify-email",
+            json={"token": token},
+        )
+        assert verify_resp.status_code == 500
+
+        # Restore commit and verify email is still unverified in DB
+        monkeypatch.setattr(AsyncSession, "commit", original_commit)
+
+        async with cookie_accounts.adapter.session_maker() as session:
+            stmt = select(EmailAddress).where(
+                EmailAddress.email == "unverified@example.com"
+            )
+            result = await session.execute(stmt)
+            email_rec = result.scalar_one_or_none()
+            assert email_rec is not None
+            assert email_rec.is_verified is False
+
+
+@pytest.mark.asyncio
+async def test_a01_injected_commit_failure_reset_password(
+    cookie_accounts: FastAPIAccounts, monkeypatch: pytest.MonkeyPatch
+):
+    """A01: Injected commit failure during password reset must return 500 and preserve existing credentials and sessions."""
+    app = FastAPI()
+    app.include_router(cookie_accounts.router, prefix="/api/v1/auth")
+
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # Register user
+        reg_resp = await client.post(
+            "/api/v1/auth/register",
+            json={"email": "reset_fail@example.com", "password": "OldPassword123!"},
+        )
+        assert reg_resp.status_code == 201
+
+        # Login to get active session
+        login_resp = await client.post(
+            "/api/v1/auth/login",
+            json={"email": "reset_fail@example.com", "password": "OldPassword123!"},
+        )
+        assert login_resp.status_code == 200
+
+        # Generate reset token with valid timestamp
+        async with cookie_accounts.adapter.session_maker() as session:
+            user = await cookie_accounts.adapter.get_user_by_email(
+                session, "reset_fail@example.com"
+            )
+            assert user is not None
+            cred = await cookie_accounts.adapter.get_password_credential(
+                session, user.id
+            )
+            assert cred is not None
+            pwd_ts = _get_pwd_state_ts(cred.password_updated_at)
+            token = cookie_accounts.generate_password_reset_token(
+                user.id, "reset_fail@example.com", pwd_ts=pwd_ts
+            )
+
+        # Inject commit failure
+        original_commit = AsyncSession.commit
+
+        async def failing_commit(self):
+            raise SQLAlchemyError("Simulated database failure during reset commit")
+
+        monkeypatch.setattr(AsyncSession, "commit", failing_commit)
+
+        reset_resp = await client.post(
+            "/api/v1/auth/reset-password",
+            json={"token": token, "new_password": "NewPassword123!"},
+        )
+        assert reset_resp.status_code == 500
+
+        # Restore commit
+        monkeypatch.setattr(AsyncSession, "commit", original_commit)
+
+        # Assert old password still works
+        old_login = await client.post(
+            "/api/v1/auth/login",
+            json={"email": "reset_fail@example.com", "password": "OldPassword123!"},
+        )
+        assert old_login.status_code == 200
+
+        # Assert new password does NOT work
+        new_login = await client.post(
+            "/api/v1/auth/login",
+            json={"email": "reset_fail@example.com", "password": "NewPassword123!"},
+        )
+        assert new_login.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_a01_injected_commit_failure_login(
+    cookie_accounts: FastAPIAccounts, monkeypatch: pytest.MonkeyPatch
+):
+    """A01: Injected commit failure during login must return 500 and persist zero sessions."""
+    app = FastAPI()
+    app.include_router(cookie_accounts.router, prefix="/api/v1/auth")
+
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # Register user
+        reg_resp = await client.post(
+            "/api/v1/auth/register",
+            json={"email": "login_fail@example.com", "password": "SecurePassword123!"},
+        )
+        assert reg_resp.status_code == 201
+
+        # Inject commit failure
+        original_commit = AsyncSession.commit
+
+        async def failing_commit(self):
+            raise SQLAlchemyError("Simulated database failure during login commit")
+
+        monkeypatch.setattr(AsyncSession, "commit", failing_commit)
+
+        login_resp = await client.post(
+            "/api/v1/auth/login",
+            json={"email": "login_fail@example.com", "password": "SecurePassword123!"},
+        )
+        assert login_resp.status_code == 500
+        # Ensure no cookie header was set
+        assert "set-cookie" not in login_resp.headers
+
+        # Restore commit and check database
+        monkeypatch.setattr(AsyncSession, "commit", original_commit)
+
+        async with cookie_accounts.adapter.session_maker() as session:
+            stmt = select(Session)
+            result = await session.execute(stmt)
+            sessions = result.scalars().all()
+            assert len(sessions) == 0
+
+
+@pytest.mark.asyncio
+async def test_a01_injected_commit_failure_change_password(
+    cookie_accounts: FastAPIAccounts, monkeypatch: pytest.MonkeyPatch
+):
+    """A01: Injected commit failure during change_password must return 500 and keep old password active."""
+    app = FastAPI()
+    app.include_router(cookie_accounts.router, prefix="/api/v1/auth")
+
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # Register and login
+        await client.post(
+            "/api/v1/auth/register",
+            json={"email": "change_fail@example.com", "password": "OldPassword123!"},
+        )
+        login_resp = await client.post(
+            "/api/v1/auth/login",
+            json={"email": "change_fail@example.com", "password": "OldPassword123!"},
+        )
+        assert login_resp.status_code == 200
+
+        # Inject commit failure
+        original_commit = AsyncSession.commit
+
+        async def failing_commit(self):
+            raise SQLAlchemyError(
+                "Simulated database failure during change_password commit"
+            )
+
+        monkeypatch.setattr(AsyncSession, "commit", failing_commit)
+
+        ch_resp = await client.post(
+            "/api/v1/auth/change-password",
+            json={
+                "current_password": "OldPassword123!",
+                "new_password": "NewPassword123!",
+                "revoke_other_sessions": True,
+            },
+        )
+        assert ch_resp.status_code == 500
+
+        # Restore commit
+        monkeypatch.setattr(AsyncSession, "commit", original_commit)
+
+        # Old password still authenticates
+        old_login = await client.post(
+            "/api/v1/auth/login",
+            json={"email": "change_fail@example.com", "password": "OldPassword123!"},
+        )
+        assert old_login.status_code == 200
+
+        # New password fails
+        new_login = await client.post(
+            "/api/v1/auth/login",
+            json={"email": "change_fail@example.com", "password": "NewPassword123!"},
+        )
+        assert new_login.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_a01_injected_logout_commit_failure_cookie_transport(
+    cookie_accounts: FastAPIAccounts, monkeypatch: pytest.MonkeyPatch
+):
+    """A01: Injected commit failure during logout must return 500, not clear cookie, and preserve active session."""
+    app = FastAPI()
+    app.include_router(cookie_accounts.router, prefix="/api/v1/auth")
+
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # Register and login
+        await client.post(
+            "/api/v1/auth/register",
+            json={
+                "email": "logout_cookie@example.com",
+                "password": "SecurePassword123!",
+            },
+        )
+        login_resp = await client.post(
+            "/api/v1/auth/login",
+            json={
+                "email": "logout_cookie@example.com",
+                "password": "SecurePassword123!",
+            },
+        )
+        assert login_resp.status_code == 200
+
+        # Check me works
+        me_before = await client.get("/api/v1/auth/me")
+        assert me_before.status_code == 200
+
+        # Inject commit failure during logout
+        original_commit = AsyncSession.commit
+
+        async def failing_commit(self):
+            raise SQLAlchemyError("Simulated database failure during logout commit")
+
+        monkeypatch.setattr(AsyncSession, "commit", failing_commit)
+
+        logout_resp = await client.post("/api/v1/auth/logout")
+        # Must return 500, never 200
+        assert logout_resp.status_code == 500
+        # Assert Set-Cookie deletion is NOT returned in the 500 response
+        set_cookie = logout_resp.headers.get("set-cookie", "")
+        assert (
+            "max-age=0" not in set_cookie.lower()
+            and "expires=thu, 01 jan 1970" not in set_cookie.lower()
+        )
+
+        # Restore commit
+        monkeypatch.setattr(AsyncSession, "commit", original_commit)
+
+        # Assert original session remains active and valid
+        me_after = await client.get("/api/v1/auth/me")
+        assert me_after.status_code == 200
+        assert me_after.json()["primary_email"] == "logout_cookie@example.com"
+
+
+@pytest.mark.asyncio
+async def test_a01_injected_logout_adapter_failure_bearer_transport(
+    bearer_accounts: FastAPIAccounts, monkeypatch: pytest.MonkeyPatch
+):
+    """A01: Injected adapter failure during bearer logout must return 500 and preserve active bearer token."""
+    app = FastAPI()
+    app.include_router(bearer_accounts.router, prefix="/api/v1/auth")
+
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # Register and login
+        await client.post(
+            "/api/v1/auth/register",
+            json={
+                "email": "logout_bearer@example.com",
+                "password": "SecurePassword123!",
+            },
+        )
+        login_resp = await client.post(
+            "/api/v1/auth/login",
+            json={
+                "email": "logout_bearer@example.com",
+                "password": "SecurePassword123!",
+            },
+        )
+        assert login_resp.status_code == 200
+        token = login_resp.json()["access_token"]
+        auth_headers = {"Authorization": f"Bearer {token}"}
+
+        # Check me works
+        me_before = await client.get("/api/v1/auth/me", headers=auth_headers)
+        assert me_before.status_code == 200
+
+        # Inject adapter failure (SQLAlchemyError)
+        async def failing_revoke(session, raw_token):
+            raise SQLAlchemyError("Simulated database failure during revoke_session")
+
+        monkeypatch.setattr(bearer_accounts.adapter, "revoke_session", failing_revoke)
+
+        logout_resp = await client.post("/api/v1/auth/logout", headers=auth_headers)
+        assert logout_resp.status_code == 500
+
+        # Unpatch
+        monkeypatch.undo()
+
+        # Assert original bearer token remains valid and session still active
+        me_after = await client.get("/api/v1/auth/me", headers=auth_headers)
+        assert me_after.status_code == 200
+        assert me_after.json()["primary_email"] == "logout_bearer@example.com"
 
 
 @pytest.mark.asyncio

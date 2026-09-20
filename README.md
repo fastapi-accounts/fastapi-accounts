@@ -51,13 +51,14 @@ Today, building authentication in FastAPI usually means either:
 ### 1. Installation
 
 ```bash
-# Install with SQLite async driver for quickstart:
-pip install "fastapi-accounts[dev]" --pre
-# or:
-pip install fastapi-accounts aiosqlite --pre
-# or with uv:
-uv add fastapi-accounts --prerelease=allow
-uv add aiosqlite
+# Install with SQLite driver:
+pip install "fastapi-accounts[sqlite]" --pre
+
+# Or install with PostgreSQL driver and Alembic migrations:
+pip install "fastapi-accounts[postgres,migrations]" --pre
+
+# Or with uv:
+uv add "fastapi-accounts[sqlite]" --prerelease=allow
 ```
 
 ### 2. Basic Application (`app.py`)
@@ -69,7 +70,7 @@ from fastapi import Depends, FastAPI
 from fastapi_accounts import FastAPIAccounts, SQLAlchemyAdapter
 
 # 1. Initialize adapter & account engine
-# In production, provide a 256-bit cryptographically random secret via environment variable:
+# In production, provide a cryptographically random secret (>= 32 chars / 256 bits):
 # $ export FASTAPI_ACCOUNTS_SECRET_KEY=$(openssl rand -hex 32)
 adapter = SQLAlchemyAdapter(database_url="sqlite+aiosqlite:///./accounts.db")
 accounts = FastAPIAccounts(
@@ -99,21 +100,67 @@ async def get_profile(user=Depends(accounts.current_active_user)):
     return {"message": f"Welcome back, {user.primary_email}!", "user_id": user.id}
 ```
 
-Run your app:
-```bash
-uvicorn app:app --reload
+---
+
+## 🗄️ Database Migrations & Legacy Adoption
+
+FastAPI Accounts ships with production-ready Alembic migrations.
+
+### Programmatic Migration Execution
+
+```python
+from alembic import command
+from fastapi_accounts.migrations import get_alembic_config
+
+# Point Alembic directly to packaged migrations
+config = get_alembic_config("sqlite:///./accounts.db")
+command.upgrade(config, "head")
 ```
 
-Visit **`http://localhost:8000/docs`** to see your fully documented authentication endpoints:
-* `POST /api/v1/auth/register`
-* `POST /api/v1/auth/verify-email`
-* `POST /api/v1/auth/request-verify-email`
-* `POST /api/v1/auth/request-password-reset`
-* `POST /api/v1/auth/reset-password`
-* `POST /api/v1/auth/change-password`
-* `POST /api/v1/auth/login`
-* `POST /api/v1/auth/logout`
-* `GET  /api/v1/auth/me`
+### CLI Configuration (`alembic.ini`)
+
+You can reference the packaged migrations directly in your `alembic.ini`:
+
+```ini
+[alembic]
+script_location = fastapi_accounts:migrations
+```
+
+Then execute:
+```bash
+alembic upgrade head
+alembic check
+```
+
+> [!NOTE]
+> Bundled migrations manage the library's default declarative models. Applications implementing custom model classes and table names should manage those schemas within their own Alembic environment.
+
+### Safe Legacy Database Upgrade Workflow
+
+If upgrading an existing database initialized with `v0.1.0a2` or `v0.1.0a3` using `adapter.create_all()`:
+
+1. **Back up your database** prior to executing schema commands.
+2. **Inspect your schema** to verify compatibility:
+   ```python
+   from sqlalchemy import create_engine
+   from fastapi_accounts.migrations import inspect_legacy_schema
+
+   engine = create_engine("sqlite:///./accounts.db")
+   with engine.connect() as conn:
+       version = inspect_legacy_schema(conn)
+       print(f"Detected schema version: {version}")
+   ```
+3. **Apply the appropriate migration path:**
+   * **If `v0.1.0a2`** (lacks `password_updated_at` column):
+     ```bash
+     alembic stamp 0001_initial_schema
+     alembic upgrade head
+     ```
+   * **If `v0.1.0a3`** (already contains `password_updated_at` and indexes):
+     ```bash
+     alembic stamp head
+     ```
+   * **If `unrecognized`:** Do not stamp; inspect your database schema for custom modifications.
 
 ---
 
@@ -121,11 +168,12 @@ Visit **`http://localhost:8000/docs`** to see your fully documented authenticati
 
 | Milestone | Target Capabilities | Status |
 | :--- | :--- | :---: |
-| **v0.1.0-alpha** | Email/Password (Argon2id), Single-use password reset with CAS, Dual-transport (Cookies + Bearer), Async SQLAlchemy 2.0 & Alembic migrations, Explicit transaction durability, Sanitized logging & DTO whitelisting | ✅ **Completed** |
-| **v0.2.0 (Async Performance & DI)** | Offload Argon2id hashing (`anyio.to_thread`), Request-scoped DB session injection, Timing oracle equalization | 🎯 **Next Sprint** |
-| **v0.3.0 (Multi-Email & DB Matrix)** | Secondary email lifecycle & promotion, PostgreSQL integration test matrix | 📋 Planned |
-| **v0.4.0 (Social Accounts)** | Google OAuth2/OIDC integration, Safe social account linking | 📋 Planned |
-| **Future Horizons** | CSRF tokens & Origin binding, Refresh token rotation, Session device management, TOTP / MFA, WebAuthn Passkeys | 💡 Under RFC |
+| **v0.1.0a4** | Argon2id hashing, Single-use password reset with CAS, Dual-transport (Cookies + Bearer), Async SQLAlchemy 2.0 & Alembic migrations (`fastapi_accounts:migrations`), Fail-safe database commit durability, Sanitized logging & DTO whitelisting | ✅ **Released** |
+| **v0.1.0a5 (Async Performance & DI)** | Offload Argon2id hashing (`anyio.to_thread`), Request-scoped DB session injection, Timing oracle equalization | 🎯 **Next Sprint** |
+| **v0.2.0a1 (Packaging & Typing)** | Complete type annotations, OpenAPI `securitySchemes` authorization in Swagger, Production secure cookie defaults | 📋 Planned |
+| **v0.3.0 (Multi-Email & DB Matrix)** | Secondary email lifecycle & promotion, PostgreSQL service container CI integration matrix | 📋 Planned |
+| **v0.4.0 (Social Accounts & MFA)** | Google OAuth2/OIDC integration, Safe social account linking, TOTP MFA | 📋 Planned |
+| **Future Horizons** | CSRF tokens & Origin binding, Refresh token rotation, Session device management, WebAuthn Passkeys | 💡 Under RFC |
 
 
 ---

@@ -454,6 +454,10 @@ class FastAPIAccounts:
                 except SQLAlchemyError as e:
                     await db.rollback()
                     logger.error("Database error during logout: %s", type(e).__name__)
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail="Database error during logout.",
+                    )
 
             self.transport.set_logout_response(response)
             return {"message": "Logged out successfully."}
