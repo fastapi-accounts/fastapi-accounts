@@ -2,7 +2,7 @@ import uuid
 from collections.abc import AsyncGenerator
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import CursorResult, delete, select
+from sqlalchemy import CursorResult, delete, select, update
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -277,6 +277,58 @@ class SQLAlchemyAdapter:
 
         await session.flush()
         # Security invariant: Revoke all active sessions upon password reset
+        await self.revoke_all_user_sessions(session, user_id)
+        return True
+
+    async def atomic_reset_password(
+        self,
+        session: AsyncSession,
+        user_id: uuid.UUID,
+        expected_pwd_ts: int,
+        new_password: str,
+    ) -> bool:
+        """Atomically verify expected password timestamp and update password with CAS semantics."""
+        if expected_pwd_ts <= 0:
+            return False
+
+        # Lock the row for update where supported (Postgres/MySQL)
+        stmt = (
+            select(self.credential_model)
+            .where(self.credential_model.user_id == user_id)
+            .with_for_update()
+        )
+        result = await session.execute(stmt)
+        cred = result.scalars().first()
+        if not cred or cred.password_updated_at is None:
+            return False
+
+        current_ts = int(cred.password_updated_at.timestamp() * 1_000_000)
+        if current_ts != expected_pwd_ts or current_ts == 0:
+            return False
+
+        now = utc_now()
+        # Atomic Compare-And-Swap update statement
+        update_stmt = (
+            update(self.credential_model)
+            .where(
+                self.credential_model.user_id == user_id,
+                self.credential_model.password_updated_at == cred.password_updated_at,
+            )
+            .values(
+                hashed_password=hash_password(new_password),
+                password_updated_at=now,
+            )
+        )
+        update_res = await session.execute(update_stmt)
+        rowcount = (
+            update_res.rowcount
+            if isinstance(update_res, CursorResult)
+            else (getattr(update_res, "rowcount", 0) or 0)
+        )
+        if rowcount != 1:
+            return False
+
+        await session.flush()
         await self.revoke_all_user_sessions(session, user_id)
         return True
 

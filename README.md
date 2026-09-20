@@ -28,21 +28,21 @@ Today, building authentication in FastAPI usually means either:
 
 ---
 
-## ✨ Key Features
+## ✨ Key Capabilities
 
-* **⚡ 15-Line Setup:** Complete authentication system mounted with a single router and sensible defaults.
-* **🍪 Native Dual-Transport:**
-  * **For Web & SPAs (React, Next.js, Vue, Svelte):** Secure `HttpOnly` `SameSite=Lax` cookies with built-in CSRF protection.
-  * **For Mobile & CLI (iOS, Flutter, React Native, Postman):** `Authorization: Bearer <token>` with refresh token rotation.
-* **📬 Real-World Account Management:**
-  * Multiple email addresses per account (Primary + Verified state machine, just like GitHub).
-  * Secure, stateless cryptographic email verification workflows (`/verify-email` & `/request-verify-email`).
-* **🛡️ Modern Security Primitives:**
-  * Modern **Argon2id** password hashing via `pwdlib`.
-  * Active session tracking (view devices/IPs, "Logout everywhere").
-* **🚀 Modern Python Native:**
-  * Built exclusively for Python 3.10+, Pydantic v2, and Async SQLAlchemy 2.0.
-  * Ready-to-use model mixins that plug directly into your existing Alembic migrations.
+* **⚡ 15-Line Setup:** Complete authentication and account lifecycle mounted with a single router and sensible defaults.
+* **🍪 Dual-Transport Architecture:**
+  * **Cookie Transport (Web & SPAs):** `HttpOnly` `SameSite=Lax` session cookies.
+  * **Bearer Transport (Mobile & CLI):** `Authorization: Bearer <token>` token transport.
+* **🛡️ Security-First Primitives:**
+  * **Argon2id** password hashing via `pwdlib`.
+  * **Single-Use Password Reset:** Fail-closed timed token verification with database atomic compare-and-swap (CAS) to prevent sequential and concurrent replay attacks.
+  * **Session Revocation:** Immediate invalidation of all existing sessions upon password reset.
+  * **Response DTO Whitelisting:** Strict serialization preventing accidental hash disclosure.
+  * **Sanitized Logging:** Zero raw security tokens or credential material in stdout/stderr/logs.
+* **🗄️ Database & Schema Management:**
+  * Async SQLAlchemy 2.0 with type-annotated declarative mixins.
+  * Included Alembic migrations with expand/backfill/constrain upgrade paths.
 
 ---
 
@@ -51,7 +51,7 @@ Today, building authentication in FastAPI usually means either:
 ### 1. Installation
 
 ```bash
-# Core package with SQLite async driver for quickstart:
+# Install with SQLite async driver for quickstart:
 pip install "fastapi-accounts[dev]" --pre
 # or:
 pip install fastapi-accounts aiosqlite --pre
@@ -63,21 +63,27 @@ uv add aiosqlite
 ### 2. Basic Application (`app.py`)
 
 ```python
+import os
 from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI
 from fastapi_accounts import FastAPIAccounts, SQLAlchemyAdapter
 
-# 1. Initialize the adapter and account engine
+# 1. Initialize adapter & account engine
+# In production, provide a 256-bit cryptographically random secret via environment variable:
+# $ export FASTAPI_ACCOUNTS_SECRET_KEY=$(openssl rand -hex 32)
 adapter = SQLAlchemyAdapter(database_url="sqlite+aiosqlite:///./accounts.db")
 accounts = FastAPIAccounts(
     adapter=adapter,
-    secret_key="super-secret-key-must-be-at-least-32-chars-long-1234567890",
+    secret_key=os.environ.get(
+        "FASTAPI_ACCOUNTS_SECRET_KEY",
+        "dev-secret-key-must-be-at-least-32-chars-long-change-in-prod-1234567890",
+    ),
 )
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Automatically create database tables on startup (for quickstarts/dev)
+    # Automatically create database tables on startup (for dev/quickstart)
     await adapter.create_all()
     yield
 
@@ -115,10 +121,11 @@ Visit **`http://localhost:8000/docs`** to see your fully documented authenticati
 
 | Milestone | Target Capabilities | Status |
 | :--- | :--- | :---: |
-| **v0.1.0-alpha** | Email/Password (Argon2id), Email verification, Timed HMAC tokens, Async SQLAlchemy 2.0, Dual-transport (Cookies + Bearer), Password reset & recovery, Authenticated password change | ✅ **Completed** |
-| **v0.2.0 (Multi-Email & DB Matrix)** | Secondary email addition/verification/removal, Primary email promotion, PostgreSQL & MySQL integration tests | 🎯 **Next Sprint** |
-| **v0.3.0 (Social Accounts)** | Google OAuth2/OIDC integration, Safe social account linking with anti-takeover verification | 📋 Planned |
-| **Future Horizons** | Additional OAuth providers (GitHub, Apple), Active session device management, TOTP / MFA, WebAuthn Passkeys | 💡 Under RFC |
+| **v0.1.0-alpha** | Email/Password (Argon2id), Single-use password reset with CAS, Dual-transport (Cookies + Bearer), Async SQLAlchemy 2.0 & Alembic migrations, Explicit transaction durability, Sanitized logging & DTO whitelisting | ✅ **Completed** |
+| **v0.2.0 (Async Performance & DI)** | Offload Argon2id hashing (`anyio.to_thread`), Request-scoped DB session injection, Timing oracle equalization | 🎯 **Next Sprint** |
+| **v0.3.0 (Multi-Email & DB Matrix)** | Secondary email lifecycle & promotion, PostgreSQL integration test matrix | 📋 Planned |
+| **v0.4.0 (Social Accounts)** | Google OAuth2/OIDC integration, Safe social account linking | 📋 Planned |
+| **Future Horizons** | CSRF tokens & Origin binding, Refresh token rotation, Session device management, TOTP / MFA, WebAuthn Passkeys | 💡 Under RFC |
 
 
 ---

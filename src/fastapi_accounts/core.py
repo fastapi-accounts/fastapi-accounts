@@ -200,7 +200,7 @@ class FastAPIAccounts:
                 )
             except SQLAlchemyError as e:
                 await db.rollback()
-                logger.error(f"Database error during registration: {e}")
+                logger.error("Database error during registration: %s", type(e).__name__)
                 raise HTTPException(
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                     detail="Database error during registration.",
@@ -230,14 +230,26 @@ class FastAPIAccounts:
                     detail="Invalid or expired verification token.",
                 )
 
-            email_record = await self.adapter.verify_email(db, email)
-            if not email_record:
+            try:
+                email_record = await self.adapter.verify_email(db, email)
+                if not email_record:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail="Email address not found.",
+                    )
+                await db.commit()
+            except HTTPException:
+                raise
+            except SQLAlchemyError as e:
+                await db.rollback()
+                logger.error(
+                    "Database error during email verification: %s", type(e).__name__
+                )
                 raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="Email address not found.",
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Database error during email verification.",
                 )
 
-            await db.commit()
             return {"message": "Email address verified successfully."}
 
         @router.post(
@@ -322,37 +334,43 @@ class FastAPIAccounts:
                     detail="Invalid token payload.",
                 )
 
-            cred = await self.adapter.get_password_credential(db, user_id)
-            if not cred:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="User account not found.",
-                )
-
-            current_pwd_ts = _get_pwd_state_ts(cred.password_updated_at)
             token_pwd_ts = token_data.get("pwd_ts")
-            # Enforce single-use: token must contain integer pwd_ts matching current password timestamp (fail closed)
+            # Fail closed: must contain valid positive integer timestamp matching current credential
             if (
                 token_pwd_ts is None
                 or not isinstance(token_pwd_ts, int)
-                or token_pwd_ts == 0
-                or token_pwd_ts != current_pwd_ts
+                or token_pwd_ts <= 0
             ):
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="Invalid or expired password reset token.",
                 )
 
-            success = await self.adapter.update_user_password(
-                session=db, user_id=user_id, new_password=payload.new_password
-            )
-            if not success:
+            try:
+                success = await self.adapter.atomic_reset_password(
+                    session=db,
+                    user_id=user_id,
+                    expected_pwd_ts=token_pwd_ts,
+                    new_password=payload.new_password,
+                )
+                if not success:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Invalid or expired password reset token.",
+                    )
+                await db.commit()
+            except HTTPException:
+                raise
+            except SQLAlchemyError as e:
+                await db.rollback()
+                logger.error(
+                    "Database error during password reset: %s", type(e).__name__
+                )
                 raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="User account not found.",
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Database error during password reset.",
                 )
 
-            await db.commit()
             return {"message": "Password has been reset successfully."}
 
         @router.post(
@@ -389,15 +407,25 @@ class FastAPIAccounts:
             client_ip = request.client.host if request.client else None
             user_agent = request.headers.get("user-agent")
 
-            await self.adapter.create_session(
-                session=db,
-                user_id=user.id,
-                raw_token=raw_session_token,
-                max_age_seconds=self.session_max_age_seconds,
-                ip_address=client_ip,
-                user_agent=user_agent,
-            )
-            await db.commit()
+            try:
+                await self.adapter.create_session(
+                    session=db,
+                    user_id=user.id,
+                    raw_token=raw_session_token,
+                    max_age_seconds=self.session_max_age_seconds,
+                    ip_address=client_ip,
+                    user_agent=user_agent,
+                )
+                await db.commit()
+            except SQLAlchemyError as e:
+                await db.rollback()
+                logger.error(
+                    "Database error during session creation: %s", type(e).__name__
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Database error during authentication.",
+                )
 
             # Set response headers or cookies based on transport
             self.transport.set_login_response(response, raw_session_token)
@@ -420,8 +448,12 @@ class FastAPIAccounts:
         ):
             raw_token = self.transport.extract_token(request)
             if raw_token:
-                await self.adapter.revoke_session(db, raw_token)
-                await db.commit()
+                try:
+                    await self.adapter.revoke_session(db, raw_token)
+                    await db.commit()
+                except SQLAlchemyError as e:
+                    await db.rollback()
+                    logger.error("Database error during logout: %s", type(e).__name__)
 
             self.transport.set_logout_response(response)
             return {"message": "Logged out successfully."}
@@ -436,24 +468,36 @@ class FastAPIAccounts:
             user: User = Depends(self.current_active_user),
             db: AsyncSession = Depends(self.adapter.get_db),
         ):
-            success = await self.adapter.verify_and_update_password(
-                session=db,
-                user_id=user.id,
-                current_password=payload.current_password,
-                new_password=payload.new_password,
-            )
-            if not success:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Current password is incorrect.",
+            try:
+                success = await self.adapter.verify_and_update_password(
+                    session=db,
+                    user_id=user.id,
+                    current_password=payload.current_password,
+                    new_password=payload.new_password,
                 )
-            if payload.revoke_other_sessions:
-                raw_token = self.transport.extract_token(request)
-                if raw_token:
-                    await self.adapter.revoke_other_user_sessions(
-                        db, user.id, raw_token
+                if not success:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Current password is incorrect.",
                     )
-            await db.commit()
+                if payload.revoke_other_sessions:
+                    raw_token = self.transport.extract_token(request)
+                    if raw_token:
+                        await self.adapter.revoke_other_user_sessions(
+                            db, user.id, raw_token
+                        )
+                await db.commit()
+            except HTTPException:
+                raise
+            except SQLAlchemyError as e:
+                await db.rollback()
+                logger.error(
+                    "Database error during password change: %s", type(e).__name__
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Database error during password change.",
+                )
             return {"message": "Password changed successfully."}
 
         @router.get(

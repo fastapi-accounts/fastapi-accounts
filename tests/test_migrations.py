@@ -7,8 +7,43 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import OperationalError
 
 from fastapi_accounts.adapters.sqlalchemy import SQLAlchemyAdapter
+
+
+@pytest.mark.asyncio
+async def test_migration_fresh_database():
+    """Test initializing a completely fresh database with alembic upgrade head."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = os.path.join(tmpdir, "fresh_test.db")
+        sync_db_url = f"sqlite:///{db_path}"
+        async_db_url = f"sqlite+aiosqlite:///{db_path}"
+
+        # 1. Run Alembic upgrade head on an empty database
+        alembic_cfg = Config("alembic.ini")
+        alembic_cfg.set_main_option("sqlalchemy.url", sync_db_url)
+        command.upgrade(alembic_cfg, "head")
+
+        # 2. Verify tables and operations work cleanly with SQLAlchemyAdapter
+        adapter = SQLAlchemyAdapter(database_url=async_db_url)
+        async with adapter.session_maker() as session:
+            _user, _email_rec = await adapter.create_user_with_password(
+                session=session,
+                email="fresh@example.com",
+                password="FreshPassword123!",
+                is_verified=True,
+            )
+            await session.commit()
+
+        async with adapter.session_maker() as session:
+            queried = await adapter.get_user_by_email(session, "fresh@example.com")
+            assert queried is not None
+            assert queried.primary_email == "fresh@example.com"
+            assert queried.password_credential is not None
+            assert queried.password_credential.password_updated_at is not None
+
+        await adapter.engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -36,7 +71,7 @@ async def test_migration_upgrade_from_legacy_schema():
             """
                 )
             )
-            # Create user_emails table
+            # Create email_addresses table
             conn.execute(
                 text(
                     """
@@ -116,16 +151,15 @@ async def test_migration_upgrade_from_legacy_schema():
 
         # 2. Before migration: querying with current model raises OperationalError (missing password_updated_at)
         adapter_pre = SQLAlchemyAdapter(database_url=async_db_url)
-        from sqlalchemy.exc import OperationalError
-
         with pytest.raises(OperationalError, match="no such column"):
             async with adapter_pre.session_maker() as session:
                 await adapter_pre.get_password_credential(session, uuid.UUID(user_id))
         await adapter_pre.engine.dispose()
 
-        # 3. Run Alembic Upgrade to head (expand/backfill/constrain)
+        # 3. Stamp 0001_initial_schema and run Alembic Upgrade to head (0002_add_password_updated_at)
         alembic_cfg = Config("alembic.ini")
         alembic_cfg.set_main_option("sqlalchemy.url", sync_db_url)
+        command.stamp(alembic_cfg, "0001_initial_schema")
         command.upgrade(alembic_cfg, "head")
 
         # 4. Post migration: verify column exists and adapter queries successfully without OperationalError

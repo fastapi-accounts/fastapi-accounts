@@ -1,3 +1,4 @@
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI
@@ -5,10 +6,14 @@ from fastapi import Depends, FastAPI
 from fastapi_accounts import FastAPIAccounts, SQLAlchemyAdapter
 
 # 1. Initialize the adapter and account engine
+# In production, pass secret_key via environment variable: export FASTAPI_ACCOUNTS_SECRET_KEY=$(openssl rand -hex 32)
 adapter = SQLAlchemyAdapter(database_url="sqlite+aiosqlite:///./example_accounts.db")
 accounts = FastAPIAccounts(
     adapter=adapter,
-    secret_key="super-secret-key-must-be-at-least-32-chars-long-1234567890",
+    secret_key=os.environ.get(
+        "FASTAPI_ACCOUNTS_SECRET_KEY",
+        "dev-secret-key-must-be-at-least-32-chars-long-change-in-prod-1234567890",
+    ),
 )
 
 

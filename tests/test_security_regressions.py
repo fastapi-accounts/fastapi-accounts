@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 
@@ -343,3 +344,92 @@ def test_s4_secret_key_length_validation(adapter: SQLAlchemyAdapter):
         assert acc_env.secret_key == "a" * 32
     finally:
         del os.environ["VALID_TEST_SECRET"]
+
+
+@pytest.mark.asyncio
+async def test_s1_concurrent_reset_token_redemption(cookie_accounts: FastAPIAccounts):
+    """S1: Simultaneous redemption of the exact same reset token must result in exactly 1 success and N-1 400 failures."""
+    app = FastAPI()
+    app.include_router(cookie_accounts.router, prefix="/api/v1/auth")
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # Register user
+        await client.post(
+            "/api/v1/auth/register",
+            json={
+                "email": "s1_concurrent@example.com",
+                "password": "OriginalPassword123!",
+            },
+        )
+
+        async with cookie_accounts.adapter.session_maker() as session:
+            user = await cookie_accounts.adapter.get_user_by_email(
+                session, "s1_concurrent@example.com"
+            )
+            assert user is not None
+            assert user.password_credential is not None
+            reset_token = cookie_accounts.generate_password_reset_token(
+                user.id,
+                "s1_concurrent@example.com",
+                pwd_ts=user.password_credential.password_updated_at,
+            )
+
+        # Launch 5 concurrent reset requests simultaneously with the same token
+        async def redeem(idx: int):
+            return await client.post(
+                "/api/v1/auth/reset-password",
+                json={"token": reset_token, "new_password": f"NewConcurrentPwd{idx}!"},
+            )
+
+        responses = await asyncio.gather(*(redeem(i) for i in range(5)))
+        status_codes = [r.status_code for r in responses]
+
+        # Invariant: EXACTLY one request succeeds (200), and all other 4 fail (400)
+        assert status_codes.count(200) == 1
+        assert status_codes.count(400) == 4
+
+
+@pytest.mark.asyncio
+async def test_database_error_does_not_disclose_credentials_in_logs(
+    cookie_accounts: FastAPIAccounts,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture,
+):
+    """S3/Security: Database exceptions containing sensitive hashes/passwords must never leak to logs or stdout/stderr."""
+    from sqlalchemy.exc import SQLAlchemyError
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    app = FastAPI()
+    app.include_router(cookie_accounts.router, prefix="/api/v1/auth")
+
+    sensitive_fake_hash = (
+        "$argon2id$v=19$m=65536,t=3,p=4$syntheticsecretleakvalue$fakehashdata"
+    )
+    sensitive_raw_pass = "SuperSensitivePasswordSecret999!"
+
+    async def failing_commit_with_credentials(self):
+        raise SQLAlchemyError(
+            f"FAILED SQL: INSERT INTO password_credentials VALUES ('{sensitive_fake_hash}') WITH '{sensitive_raw_pass}'"
+        )
+
+    monkeypatch.setattr(AsyncSession, "commit", failing_commit_with_credentials)
+
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+    with caplog.at_level(logging.DEBUG):
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                "/api/v1/auth/register",
+                json={
+                    "email": "s3_leaktest@example.com",
+                    "password": sensitive_raw_pass,
+                },
+            )
+            assert resp.status_code == 500
+
+    captured = capsys.readouterr()
+    all_output = captured.out + captured.err + caplog.text
+
+    assert sensitive_fake_hash not in all_output
+    assert sensitive_raw_pass not in all_output
