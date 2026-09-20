@@ -147,9 +147,11 @@ class TimedTokenSigner:
             if data.get("exp", 0) < time.time():
                 return None, None
 
-            # Invariant: v2 tokens MUST use derived signature; reject raw legacy key for v2 fail-closed
-            if key_kind == KeyKind.RAW_FALLBACK and data.get("token_v") == 2:
-                return None, None
+            # Invariant: Raw legacy fallback keys must ONLY be accepted for unversioned or token_v == 1 payloads
+            if key_kind == KeyKind.RAW_FALLBACK:
+                token_v = data.get("token_v")
+                if token_v is not None and token_v != 1:
+                    return None, None
 
             return data, key_kind
         except (

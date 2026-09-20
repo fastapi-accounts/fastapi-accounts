@@ -57,39 +57,44 @@ async def test_async_verify_dummy_password():
 
 
 @pytest.mark.asyncio
-async def test_event_loop_not_blocked_during_hashing():
+async def test_event_loop_not_blocked_during_hashing(monkeypatch):
     """Verify that CPU-intensive Argon2 operations offloaded via worker threads do not block event loop progress."""
     import threading
 
-    import anyio
+    import fastapi_accounts.security.password as pwd_module
 
     svc = PasswordService(argon2_concurrency=4)
 
-    # 1. Deterministic thread-offload verification: event loop yields while thread waits
+    # 1. Deterministic thread-offload verification: intercept synchronous hash_password with threading.Event
     worker_started = threading.Event()
     worker_can_finish = threading.Event()
-    loop_progressed = False
 
-    def blocking_worker() -> str:
+    def blocking_hash(secret: str) -> str:
         worker_started.set()
         worker_can_finish.wait(timeout=5.0)
-        return "worker_completed"
+        return "$argon2id$mock_blocked_hash"
 
-    async def run_worker() -> str:
-        return await anyio.to_thread.run_sync(blocking_worker, limiter=svc._limiter)
+    monkeypatch.setattr(pwd_module, "hash_password", blocking_hash)
 
-    task = asyncio.create_task(run_worker())
+    task = asyncio.create_task(svc.async_hash_password("SuperSecret123!"))
 
     while not worker_started.is_set():
         await asyncio.sleep(0.001)
 
-    # Event loop continues processing while thread is blocked
-    loop_progressed = True
+    # Event loop continues processing while offloaded worker thread is blocked
+    loop_progressed = False
+    for _ in range(5):
+        await asyncio.sleep(0.005)
+        loop_progressed = True
+
+    assert loop_progressed is True
     worker_can_finish.set()
 
     res = await task
-    assert res == "worker_completed"
-    assert loop_progressed is True
+    assert res == "$argon2id$mock_blocked_hash"
+
+    # Restore unpatched hash_password for live Argon2 hashing heartbeat concurrency test
+    monkeypatch.undo()
 
     # 2. Live Argon2 hashing heartbeat concurrency
     ticks = 0

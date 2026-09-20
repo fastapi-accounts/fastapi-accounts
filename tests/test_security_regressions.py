@@ -616,17 +616,20 @@ def test_resolve_client_ip_trusted_proxy():
             self.client = DummyClient(client_host)
             self.headers = Headers(headers_dict)
 
-    # 1. Zero trusted proxies: always returns client.host, ignoring X-Forwarded-For
+    # 1. Untrusted peer: always returns client.host, ignoring X-Forwarded-For
     req0 = DummyRequest("10.0.0.1", {"x-forwarded-for": "198.51.100.1, 203.0.113.195"})
-    assert resolve_client_ip(req0, trusted_proxy_count=0) == "10.0.0.1"
+    assert resolve_client_ip(req0, trusted_proxies=["127.0.0.1"]) == "10.0.0.1"
 
-    # 2. One trusted proxy: client.host (10.0.0.1) is proxy, client is 203.0.113.195
+    # 2. Trusted peer proxy: returns first untrusted IP from right to left
     req1 = DummyRequest("10.0.0.1", {"x-forwarded-for": "198.51.100.1, 203.0.113.195"})
-    assert resolve_client_ip(req1, trusted_proxy_count=1) == "203.0.113.195"
+    assert resolve_client_ip(req1, trusted_proxies=["10.0.0.1"]) == "203.0.113.195"
 
     # 3. Two trusted proxies: client is 198.51.100.1
     req2 = DummyRequest("10.0.0.1", {"x-forwarded-for": "198.51.100.1, 203.0.113.195"})
-    assert resolve_client_ip(req2, trusted_proxy_count=2) == "198.51.100.1"
+    assert (
+        resolve_client_ip(req2, trusted_proxies=["10.0.0.1", "203.0.113.195"])
+        == "198.51.100.1"
+    )
 
 
 @pytest.mark.asyncio
@@ -716,16 +719,115 @@ async def test_csrf_cross_type_and_session_ab_isolation(
         )
         assert valid_resp.status_code == 200
 
-        # 4. User A logs out (idempotent POST /logout)
+        # 4. User A logs out (POST /logout with session CSRF)
         logout1 = await client_a.post(
             "/api/v1/auth/logout",
             headers={"Origin": "http://test", "X-CSRF-Token": csrf_a},
         )
         assert logout1.status_code == 200
 
-        # Second logout is safe and idempotent
-        logout2 = await client_a.post("/api/v1/auth/logout")
+        # Second logout without CSRF is 403 Forbidden because CookieTransport enforces CSRF on all mutating endpoints
+        logout_no_csrf = await client_a.post("/api/v1/auth/logout")
+        assert logout_no_csrf.status_code == 403
+
+        # Second logout with valid pre-auth CSRF token succeeds idempotently
+        csrf_init_after = await client_a.get("/api/v1/auth/csrf")
+        fresh_pre_auth = csrf_init_after.json()["csrf_token"]
+        logout2 = await client_a.post(
+            "/api/v1/auth/logout",
+            headers={"Origin": "http://test", "X-CSRF-Token": fresh_pre_auth},
+        )
         assert logout2.status_code == 200
 
         # Calling /me is now 401 Unauthorized
         assert (await client_a.get("/api/v1/auth/me")).status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_login_reset_in_flight_race(cookie_accounts: FastAPIAccounts):
+    """F3 / P0 #2, P0 #10: Verify in-flight login with old password fails atomically if password reset completes concurrently."""
+    app = FastAPI()
+    app.include_router(cookie_accounts.router, prefix="/api/v1/auth")
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # 1. Bootstrap CSRF & register user
+        csrf_init = await client.get("/api/v1/auth/csrf")
+        pre_auth_csrf = csrf_init.json()["csrf_token"]
+
+        reg_resp = await client.post(
+            "/api/v1/auth/register",
+            json={"email": "race_user@example.com", "password": "OldPassword123!"},
+            headers={"Origin": "http://test", "X-CSRF-Token": pre_auth_csrf},
+        )
+        assert reg_resp.status_code == 201
+
+        # 2. Authenticate user with old password (simulating authentication phase of login)
+        async with cookie_accounts.adapter.session_maker() as db_session:
+            principal, cred_v = await cookie_accounts.service.authenticate_user(
+                db_session, "race_user@example.com", "OldPassword123!"
+            )
+            assert principal is not None
+            assert cred_v == 1
+
+            # 3. Simulate concurrent password reset completing while login is in-flight
+            reset_token = cookie_accounts.service.generate_password_reset_token(
+                principal.id, "race_user@example.com", credential_version=1
+            )
+            reset_ok = await cookie_accounts.service.reset_password(
+                db_session, reset_token, "BrandNewPassword456!"
+            )
+            assert reset_ok is True
+
+            # 4. In-flight login attempts to issue session using old cred_v=1 -> rejected!
+            with pytest.raises(ValueError, match="Credential version mismatch"):
+                await cookie_accounts.service.create_session(
+                    session=db_session,
+                    user_id=principal.id,
+                    expected_credential_version=cred_v,
+                )
+
+
+@pytest.mark.asyncio
+async def test_rate_limiter_expired_key_renewal_under_capacity():
+    """F4 / P0 #8: Retain window durations when expired keys start a new window under capacity pressure."""
+    import time
+
+    from fastapi_accounts.security.rate_limiter import InMemorySlidingWindowLimiter
+
+    limiter = InMemorySlidingWindowLimiter(max_keys=2)
+
+    # 1. Add key1 with 3600s window duration
+    ok1, _ = await limiter.check_rate_limit(
+        "key_long", max_requests=1, window_seconds=3600
+    )
+    assert ok1 is True
+    assert limiter._window_durations["key_long"] == 3600
+
+    # 2. Simulate time passing so key_long expires
+    limiter._windows["key_long"] = [time.monotonic() - 3700]
+
+    # 3. Key_long makes a new request -> cleans expired timestamp, pops metadata, but restores window_duration=3600
+    ok_renew, _ = await limiter.check_rate_limit(
+        "key_long", max_requests=1, window_seconds=3600
+    )
+    assert ok_renew is True
+    assert limiter._window_durations["key_long"] == 3600
+
+    # 4. Add key_short with 60s window duration
+    ok_short, _ = await limiter.check_rate_limit(
+        "key_short", max_requests=1, window_seconds=60
+    )
+    assert ok_short is True
+
+    # 5. Add key_third with 60s window duration after 120s simulated
+    limiter._windows["key_short"] = [time.monotonic() - 120]
+
+    # Key_long is at age 120s, which is NOT expired for its 3600s window
+    ok_third, _ = await limiter.check_rate_limit(
+        "key_third", max_requests=1, window_seconds=60
+    )
+    assert ok_third is True
+
+    # key_short was expired and cleaned; key_long must still be retained because its 3600s window was preserved
+    assert "key_long" in limiter._windows

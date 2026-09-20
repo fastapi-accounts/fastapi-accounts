@@ -101,11 +101,28 @@ def test_timed_token_signer_key_kind_and_legacy_raw_fallback():
     assert kind_legacy == KeyKind.RAW_FALLBACK
     assert payload_legacy["email"] == "legacy@example.com"
 
-    # 3. Raw key token attempting token_v = 2 must be rejected!
-    spoofed_token = _make_raw_token({"email": "spoof@example.com", "token_v": 2})
-    payload_spoofed, kind_spoofed = signer.verify_token_with_kind(spoofed_token)
-    assert payload_spoofed is None
-    assert kind_spoofed is None
+    # 3. Raw key token attempting token_v = 2 or token_v = 999 must be rejected!
+    spoofed_token_v2 = _make_raw_token({"email": "spoof@example.com", "token_v": 2})
+    payload_spoofed_v2, kind_spoofed_v2 = signer.verify_token_with_kind(
+        spoofed_token_v2
+    )
+    assert payload_spoofed_v2 is None
+    assert kind_spoofed_v2 is None
+
+    spoofed_token_v999 = _make_raw_token({"email": "spoof@example.com", "token_v": 999})
+    payload_spoofed_v999, kind_spoofed_v999 = signer.verify_token_with_kind(
+        spoofed_token_v999
+    )
+    assert payload_spoofed_v999 is None
+    assert kind_spoofed_v999 is None
+
+    # 4. Unversioned raw key token is accepted as raw fallback
+    unversioned_token = _make_raw_token({"email": "unversioned@example.com"})
+    payload_unversioned, kind_unversioned = signer.verify_token_with_kind(
+        unversioned_token
+    )
+    assert payload_unversioned is not None
+    assert kind_unversioned == KeyKind.RAW_FALLBACK
 
 
 def test_secret_key_rotation():

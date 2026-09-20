@@ -96,7 +96,7 @@ app.include_router(accounts.router, prefix="/api/v1/auth")
 
 @app.get("/me")
 async def get_me(user=Depends(accounts.current_active_user)):
-    return {"email": user.primary_email}
+    return {"email": user.email}
 ```
 
 ---
@@ -106,7 +106,7 @@ async def get_me(user=Depends(accounts.current_active_user)):
 In early September 2026, we tagged `v0.1.0a1` on PyPI and introduced **FastAPI Accounts** to the community on GitHub Discussions and Hacker News:
 > *"Show HN: FastAPI Accounts – 15-line batteries-included account engine for FastAPI"*
 
-The response reinforced our core conviction: developers were tired of fragmented auth snippets and vendor lock-in. The community wanted a rock-solid, production-grade library that handled the messy security edge cases without getting in their way.
+The response reinforced our core conviction: developers were tired of fragmented auth snippets and vendor lock-in. The community wanted a rock-solid library that handled the messy security edge cases without getting in their way.
 
 ---
 
@@ -133,7 +133,7 @@ With the core vertical slice validated, we immediately tackled the most critical
 
 ## 🛡️ Chapter 8: Phase 1 Hardening (`v0.1.0a5`) — Rigorous Security Audits
 
-In late September 2026, we subjected the entire codebase to an exhaustive P0 security and architecture audit. Rather than papering over edge cases, we re-architected the system to deliver bank-grade guarantees:
+In late September 2026, we subjected the entire codebase to an exhaustive P0 security and architecture audit. Rather than papering over edge cases, we re-architected the system to deliver strict security guarantees:
 
 1. **Monotonic Credential Versioning with CAS:** Password mutations utilize atomic SQL Compare-and-Swap on `credential_version >= 1`, guaranteeing replay immunity even under frozen system clocks.
 2. **Asynchronous Bounded Argon2id Hashing:** Offloaded password hashing to worker threads bounded by concurrency limiters with length bounds and constant-time dummy verification.

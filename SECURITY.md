@@ -12,12 +12,10 @@
 We take the security of `fastapi-accounts` seriously. If you discover a vulnerability or security defect, please report it responsibly through private channels.
 
 ### Coordinated Disclosure Channels:
-1. **GitHub Private Vulnerability Reporting (Preferred):**  
-   Use GitHub's Private Vulnerability Reporting mechanism via the repository's "Security" tab $\to$ "Report a vulnerability".
-2. **Security Email Channel:**  
-   Email `security@fastapi-accounts.org` with details and proof-of-concept steps.
-
-*Release checklist prerequisite:* Maintainers ensure private vulnerability reporting is verified and enabled before publishing releases.
+1. **Security Email Channel (Primary):**  
+   Email `security@fastapi-accounts.org` with vulnerability details and reproduction steps.
+2. **GitHub Private Vulnerability Reporting:**  
+   GitHub Private Vulnerability Reporting will be enabled under the repository "Security" tab upon public repository provisioning.
 
 Please do not open public GitHub issues or discussions for undisclosed vulnerabilities. You will receive an initial response within 48 hours.
 

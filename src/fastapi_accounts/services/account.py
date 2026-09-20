@@ -170,7 +170,7 @@ class AccountService:
 
     async def authenticate_user(
         self, session: AsyncSession, email: str, password: str
-    ) -> tuple[UserPrincipal | None, str | None]:
+    ) -> tuple[UserPrincipal | None, int | None]:
         """Verify user credentials with dummy hash equalization on non-existent users."""
         clean_email = email.strip().lower()
         user = await self.store.get_user_by_email(session, clean_email)
@@ -189,8 +189,9 @@ class AccountService:
         if not is_valid:
             return None, None
 
+        cred_v = getattr(cred, "credential_version", 1)
         principal = _to_principal(user, clean_email)
-        return principal, clean_email
+        return principal, cred_v
 
     async def request_password_reset(
         self, session: AsyncSession, email: str
@@ -355,12 +356,23 @@ class AccountService:
         session: AsyncSession,
         user_id: uuid.UUID,
         max_age_seconds: int = 86400 * 14,
+        expected_credential_version: int | None = None,
         ip_address: str | None = None,
         user_agent: str | None = None,
     ) -> tuple[str, str]:
         """Issue new session record and return (raw_session_token, session_id)."""
         raw_token = generate_secure_token(32)
         try:
+            if expected_credential_version is not None:
+                cred = await self.store.get_password_credential(session, user_id)
+                if (
+                    not cred
+                    or getattr(cred, "credential_version", 1)
+                    != expected_credential_version
+                ):
+                    raise ValueError(
+                        "Credential version mismatch during session creation"
+                    )
             session_rec = await self.store.create_session(
                 session=session,
                 user_id=user_id,

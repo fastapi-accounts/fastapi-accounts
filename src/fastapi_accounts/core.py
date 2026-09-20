@@ -56,15 +56,15 @@ def _now() -> datetime:
 
 def _to_user_read(principal: UserPrincipal) -> UserRead:
     emails_list = []
-    if principal.email:
+    if principal.email and principal.email_id and principal.email_created_at:
         emails_list.append(
             EmailAddressRead(
-                id=principal.email_id or principal.id,
+                id=principal.email_id,
                 user_id=principal.id,
                 email=principal.email,
                 is_verified=principal.is_verified,
                 is_primary=True,
-                created_at=principal.email_created_at or principal.created_at or _now(),
+                created_at=principal.email_created_at,
             )
         )
     return UserRead(
@@ -73,7 +73,7 @@ def _to_user_read(principal: UserPrincipal) -> UserRead:
         is_active=principal.is_active,
         is_superuser=principal.is_superuser,
         created_at=principal.created_at or _now(),
-        updated_at=principal.updated_at or _now(),
+        updated_at=principal.updated_at,
         emails=emails_list,
     )
 
@@ -458,7 +458,7 @@ class FastAPIAccounts:
             )
             self._enforce_csrf(request, context=CSRFContext.PRE_AUTH)
 
-            principal, _email_str = await self.service.authenticate_user(
+            principal, cred_version = await self.service.authenticate_user(
                 session=db, email=payload.email, password=payload.password
             )
             if not principal:
@@ -481,8 +481,14 @@ class FastAPIAccounts:
                     session=db,
                     user_id=principal.id,
                     max_age_seconds=self.session_max_age_seconds,
+                    expected_credential_version=cred_version,
                     ip_address=client_ip,
                     user_agent=user_agent,
+                )
+            except ValueError:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Invalid email or password.",
                 )
             except SQLAlchemyError as e:
                 logger.error(
@@ -525,7 +531,7 @@ class FastAPIAccounts:
                 if session_info:
                     current_sid = session_info[1]
 
-            if isinstance(self.transport, CookieTransport) and current_sid:
+            if isinstance(self.transport, CookieTransport):
                 self._enforce_csrf(
                     request,
                     current_session_id=current_sid,

@@ -386,6 +386,93 @@ def test_inspect_legacy_schema_outcomes():
             conn.commit()
             assert inspect_legacy_schema(conn).state == SchemaState.UNKNOWN
 
+        # 5. Multiple revision rows in alembic_version -> UNKNOWN
+        with engine.connect() as conn:
+            conn.execute(text("DELETE FROM alembic_version"))
+            conn.execute(
+                text("INSERT INTO alembic_version VALUES ('0001_initial_schema')")
+            )
+            # Add second version row without PK restriction on test table
+            conn.execute(text("DROP TABLE alembic_version"))
+            conn.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32))"))
+            conn.execute(
+                text("INSERT INTO alembic_version VALUES ('0001_initial_schema')")
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO alembic_version VALUES ('0002_add_password_updated_at')"
+                )
+            )
+            conn.commit()
+            assert inspect_legacy_schema(conn).state == SchemaState.UNKNOWN
+
+        # 6. Alembic version table present with 4 junk tables -> UNKNOWN
+        with engine.connect() as conn:
+            conn.execute(text("DROP TABLE alembic_version"))
+            conn.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32))"))
+            conn.execute(
+                text(
+                    "INSERT INTO alembic_version VALUES ('0004_add_credential_version')"
+                )
+            )
+            conn.execute(text("DROP TABLE users"))
+            conn.execute(text("DROP TABLE email_addresses"))
+            conn.execute(text("DROP TABLE password_credentials"))
+            conn.execute(text("DROP TABLE sessions"))
+            # Create junk tables with wrong schema
+            conn.execute(text("CREATE TABLE users (junk_col TEXT)"))
+            conn.execute(text("CREATE TABLE email_addresses (junk_col TEXT)"))
+            conn.execute(text("CREATE TABLE password_credentials (junk_col TEXT)"))
+            conn.execute(text("CREATE TABLE sessions (junk_col TEXT)"))
+            conn.commit()
+            assert inspect_legacy_schema(conn).state == SchemaState.UNKNOWN
+
+        # 7. Check constraint with non-positive predicate (e.g. <= 0) -> UNKNOWN
+        with engine.connect() as conn:
+            conn.execute(text("DROP TABLE IF EXISTS alembic_version"))
+            conn.execute(text("DROP TABLE users"))
+            conn.execute(text("DROP TABLE email_addresses"))
+            conn.execute(text("DROP TABLE password_credentials"))
+            conn.execute(text("DROP TABLE sessions"))
+            conn.execute(
+                text(
+                    "CREATE TABLE users (id CHAR(36) PRIMARY KEY, is_active BOOLEAN NOT NULL DEFAULT 1, is_superuser BOOLEAN NOT NULL DEFAULT 0, created_at TIMESTAMP NOT NULL, updated_at TIMESTAMP NOT NULL)"
+                )
+            )
+            conn.execute(
+                text(
+                    "CREATE TABLE email_addresses (id CHAR(36) PRIMARY KEY, user_id CHAR(36) NOT NULL REFERENCES users(id), email VARCHAR(320) NOT NULL UNIQUE, is_verified BOOLEAN NOT NULL DEFAULT 0, is_primary BOOLEAN NOT NULL DEFAULT 0, created_at TIMESTAMP NOT NULL)"
+                )
+            )
+            conn.execute(
+                text(
+                    "CREATE TABLE sessions (id VARCHAR(64) PRIMARY KEY, user_id CHAR(36) NOT NULL REFERENCES users(id), created_at TIMESTAMP NOT NULL, expires_at TIMESTAMP NOT NULL, ip_address VARCHAR(45), user_agent VARCHAR(512))"
+                )
+            )
+            conn.execute(text("CREATE INDEX ix_sessions_user_id ON sessions(user_id)"))
+            conn.execute(
+                text("CREATE INDEX ix_sessions_expires_at ON sessions(expires_at)")
+            )
+            # password_credentials with bad check constraint <= 0
+            conn.execute(
+                text(
+                    "CREATE TABLE password_credentials (id CHAR(36) PRIMARY KEY, user_id CHAR(36) NOT NULL UNIQUE REFERENCES users(id), hashed_password VARCHAR(1024) NOT NULL, password_updated_at TIMESTAMP NOT NULL, credential_version INTEGER NOT NULL DEFAULT 1, created_at TIMESTAMP NOT NULL, updated_at TIMESTAMP NOT NULL, CONSTRAINT ck_bad CHECK (credential_version <= 0))"
+                )
+            )
+            conn.commit()
+            assert inspect_legacy_schema(conn).state == SchemaState.UNKNOWN
+
+        # 8. NUMERIC column type for credential_version -> UNKNOWN
+        with engine.connect() as conn:
+            conn.execute(text("DROP TABLE password_credentials"))
+            conn.execute(
+                text(
+                    "CREATE TABLE password_credentials (id CHAR(36) PRIMARY KEY, user_id CHAR(36) NOT NULL UNIQUE REFERENCES users(id), hashed_password VARCHAR(1024) NOT NULL, password_updated_at TIMESTAMP NOT NULL, credential_version NUMERIC(10, 0) NOT NULL DEFAULT 1, created_at TIMESTAMP NOT NULL, updated_at TIMESTAMP NOT NULL, CONSTRAINT ck_password_credentials_credential_version_positive CHECK (credential_version >= 1))"
+                )
+            )
+            conn.commit()
+            assert inspect_legacy_schema(conn).state == SchemaState.UNKNOWN
+
 
 def test_get_alembic_config_helper_percent_escaping():
     test_url = "postgresql+asyncpg://user:p%25ss@localhost:5432/test_db%25"

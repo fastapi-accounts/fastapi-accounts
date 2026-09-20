@@ -96,6 +96,7 @@ class InMemorySlidingWindowLimiter:
 
             timestamps.append(now)
             self._windows[key] = timestamps
+            self._window_durations[key] = window_seconds
             self._last_accessed[key] = now
             return True, 0
 
@@ -117,7 +118,6 @@ def build_rate_limit_key(
 def resolve_client_ip(
     request: Request,
     trusted_proxies: Sequence[str] | None = None,
-    trusted_proxy_count: int = 0,
 ) -> str:
     """Extract client IP address, honoring X-Forwarded-For right-to-left only from trusted proxies."""
     peer_ip = request.client.host if request.client else "127.0.0.1"
@@ -129,11 +129,6 @@ def resolve_client_ip(
     hops = [h.strip() for h in xff.split(",") if h.strip()]
     if not hops:
         return peer_ip
-
-    if trusted_proxy_count > 0:
-        if len(hops) >= trusted_proxy_count:
-            return hops[-trusted_proxy_count]
-        return hops[0]
 
     if not trusted_proxies or peer_ip not in trusted_proxies:
         return peer_ip
