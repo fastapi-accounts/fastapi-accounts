@@ -13,6 +13,8 @@ class UserPrincipal(BaseModel):
 
     id: uuid.UUID
     email: str | None = None
+    email_id: uuid.UUID | None = None
+    email_created_at: datetime | None = None
     is_active: bool = True
     is_superuser: bool = False
     is_verified: bool = False

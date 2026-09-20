@@ -52,9 +52,60 @@ def test_secret_key_validation_and_placeholder_rejection():
     with pytest.raises(ValueError, match="at least 32 characters"):
         TimedTokenSigner("short")
 
-    # Known placeholder rejected
-    with pytest.raises(ValueError, match="Insecure placeholder"):
-        TimedTokenSigner("change-me-in-production-0123456789")
+    # Known placeholders rejected
+    placeholders = [
+        "change-me-in-production-0123456789",
+        "dev-secret-key-must-be-at-least-32-chars-long-change-in-prod-1234567890",
+        "secret-key-must-be-at-least-32-chars-long-for-tests-1234567890",
+        "temporary-secret-key-do-not-use-in-production-0123456789",
+    ]
+    for p in placeholders:
+        with pytest.raises(ValueError, match="Insecure placeholder"):
+            TimedTokenSigner(p)
+
+
+def test_timed_token_signer_key_kind_and_legacy_raw_fallback():
+    import base64
+    import hashlib
+    import hmac
+    import json
+    import time
+
+    from fastapi_accounts.security.tokens import KeyKind
+
+    signer = TimedTokenSigner(KEY_A)
+
+    # 1. Normal derived key token
+    token = signer.create_token(
+        {"email": "test@example.com", "action": "verify_email", "token_v": 2}
+    )
+    payload, kind = signer.verify_token_with_kind(token)
+    assert payload is not None
+    assert kind == KeyKind.DERIVED
+    assert payload["token_v"] == 2
+
+    # 2. Legacy raw key token with token_v = 1
+    def _make_raw_token(p: dict) -> str:
+        data = {**p, "exp": int(time.time()) + 3600}
+        jb = json.dumps(data, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        pb64 = base64.urlsafe_b64encode(jb).decode("utf-8").rstrip("=")
+        sig = hmac.new(
+            KEY_A.encode("utf-8"), pb64.encode("utf-8"), hashlib.sha256
+        ).digest()
+        sb64 = base64.urlsafe_b64encode(sig).decode("utf-8").rstrip("=")
+        return f"{pb64}.{sb64}"
+
+    legacy_token = _make_raw_token({"email": "legacy@example.com", "token_v": 1})
+    payload_legacy, kind_legacy = signer.verify_token_with_kind(legacy_token)
+    assert payload_legacy is not None
+    assert kind_legacy == KeyKind.RAW_FALLBACK
+    assert payload_legacy["email"] == "legacy@example.com"
+
+    # 3. Raw key token attempting token_v = 2 must be rejected!
+    spoofed_token = _make_raw_token({"email": "spoof@example.com", "token_v": 2})
+    payload_spoofed, kind_spoofed = signer.verify_token_with_kind(spoofed_token)
+    assert payload_spoofed is None
+    assert kind_spoofed is None
 
 
 def test_secret_key_rotation():

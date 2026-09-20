@@ -569,3 +569,97 @@ async def test_post_commit_callback_failure_and_delivery_hook(
     # Invariant: on_delivery_failure hook was executed
     assert len(delivery_hook_calls) == 1
     assert "register:callback_test@example.com:RuntimeError" in delivery_hook_calls[0]
+
+
+@pytest.mark.asyncio
+async def test_email_id_stability_across_multiple_me_calls(
+    cookie_accounts: FastAPIAccounts,
+):
+    """Verify that email.id in UserRead DTO reflects the true persisted DB id and is stable across multiple /me calls."""
+    app = FastAPI()
+    app.include_router(cookie_accounts.router, prefix="/api/v1/auth")
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # Register and Login
+        reg_resp = await client.post(
+            "/api/v1/auth/register",
+            json={"email": "stable_id@example.com", "password": "Password123!"},
+        )
+        assert reg_resp.status_code == 201
+        reg_data = reg_resp.json()
+        assert len(reg_data["emails"]) == 1
+        reg_email_id = reg_data["emails"][0]["id"]
+
+        await client.post(
+            "/api/v1/auth/login",
+            json={"email": "stable_id@example.com", "password": "Password123!"},
+        )
+
+        me1 = await client.get("/api/v1/auth/me")
+        assert me1.status_code == 200
+        me1_data = me1.json()
+        email_id_1 = me1_data["emails"][0]["id"]
+
+        me2 = await client.get("/api/v1/auth/me")
+        assert me2.status_code == 200
+        me2_data = me2.json()
+        email_id_2 = me2_data["emails"][0]["id"]
+
+        # Invariant: Email ID must match database record and must not be a volatile uuid4()
+        assert reg_email_id == email_id_1 == email_id_2
+
+        # Verify against database record
+        async with cookie_accounts.adapter.session_maker() as session:
+            user = await cookie_accounts.adapter.get_user_by_email(
+                session, "stable_id@example.com"
+            )
+            assert user is not None
+            assert str(user.emails[0].id) == email_id_1
+
+
+@pytest.mark.asyncio
+async def test_callable_object_callbacks_and_hook_error_containment(
+    cookie_accounts: FastAPIAccounts,
+):
+    """Verify callable object instances work as callbacks and delivery hook errors are safely contained."""
+    app = FastAPI()
+    app.include_router(cookie_accounts.router, prefix="/api/v1/auth")
+
+    class CallableNotifier:
+        def __init__(self):
+            self.invocations: list[str] = []
+
+        async def __call__(self, user, token):
+            self.invocations.append(user.email)
+            raise RuntimeError("Notifier intentional failure")
+
+    class FailingHook:
+        def __init__(self):
+            self.invocations: list[str] = []
+
+        def __call__(self, action, user, error):
+            self.invocations.append(f"{action}:{user.email}")
+            raise RuntimeError("Hook itself failed")
+
+    notifier = CallableNotifier()
+    hook = FailingHook()
+
+    cookie_accounts.service.on_after_register = notifier
+    cookie_accounts.service.on_delivery_failure = hook
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/api/v1/auth/register",
+            json={
+                "email": "callable_hook@example.com",
+                "password": "Password123!",
+            },
+        )
+        # Even with notifier failure AND hook failure, registration must succeed with 201
+        assert resp.status_code == 201
+
+    assert len(notifier.invocations) == 1
+    assert len(hook.invocations) == 1
+    assert hook.invocations[0] == "register:callable_hook@example.com"

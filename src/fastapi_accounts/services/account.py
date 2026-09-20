@@ -17,19 +17,35 @@ logger = logging.getLogger("fastapi_accounts.account_service")
 
 
 def _to_principal(
-    user: Any, primary_email: str | None = None, is_verified: bool = False
+    user: Any,
+    primary_email: str | None = None,
+    is_verified: bool = False,
+    email_record: Any | None = None,
 ) -> UserPrincipal:
     email_val = primary_email
     verified_val = is_verified
-    if not email_val and hasattr(user, "emails") and user.emails:
+    email_id_val = None
+    email_created_at_val = None
+
+    if email_record is not None:
+        email_val = getattr(email_record, "email", email_val)
+        verified_val = getattr(email_record, "is_verified", verified_val)
+        email_id_val = getattr(email_record, "id", None)
+        email_created_at_val = getattr(email_record, "created_at", None)
+    elif hasattr(user, "emails") and user.emails:
         primary_record = next(
             (e for e in user.emails if getattr(e, "is_primary", False)), user.emails[0]
         )
         email_val = primary_record.email
         verified_val = primary_record.is_verified
+        email_id_val = primary_record.id
+        email_created_at_val = primary_record.created_at
+
     return UserPrincipal(
         id=user.id,
         email=email_val,
+        email_id=email_id_val,
+        email_created_at=email_created_at_val,
         is_active=user.is_active,
         is_superuser=user.is_superuser,
         is_verified=verified_val,
@@ -50,6 +66,7 @@ class AccountService:
         on_after_request_password_reset: Callable[..., Any] | None = None,
         on_delivery_failure: Callable[..., Any] | None = None,
         reset_password_token_max_age_seconds: int = 900,
+        allow_legacy_tokens: bool = False,
     ):
         self.store = store
         self.password_service = password_service
@@ -58,6 +75,7 @@ class AccountService:
         self.on_after_request_password_reset = on_after_request_password_reset
         self.on_delivery_failure = on_delivery_failure
         self.reset_password_token_max_age_seconds = reset_password_token_max_age_seconds
+        self.allow_legacy_tokens = allow_legacy_tokens
 
     async def _invoke_callback_safely(
         self,
@@ -129,7 +147,7 @@ class AccountService:
         hashed_pwd = await self.password_service.async_hash_password(password)
 
         try:
-            user, _email_rec = await self.store.create_user_with_password(
+            user, email_rec = await self.store.create_user_with_password(
                 session=session,
                 email=clean_email,
                 hashed_password=hashed_pwd,
@@ -137,7 +155,9 @@ class AccountService:
                 is_superuser=is_superuser,
             )
             await session.commit()
-            principal = _to_principal(user, clean_email, is_verified)
+            principal = _to_principal(
+                user, clean_email, is_verified, email_record=email_rec
+            )
         except Exception:
             await session.rollback()
             raise
@@ -189,13 +209,36 @@ class AccountService:
             return principal, token
         return None, None
 
+    async def request_verify_email(
+        self, session: AsyncSession, email: str
+    ) -> tuple[UserPrincipal | None, str | None]:
+        """Look up user by email and send verification token if unverified."""
+        clean_email = email.strip().lower()
+        user = await self.store.get_user_by_email(session, clean_email)
+        if user and user.is_active:
+            for email_rec in getattr(user, "emails", []):
+                if email_rec.email == clean_email and not email_rec.is_verified:
+                    principal = _to_principal(
+                        user, clean_email, is_verified=False, email_record=email_rec
+                    )
+                    token = self.generate_email_verification_token(clean_email)
+                    await self._invoke_callback_safely(
+                        self.on_after_register, "request_verify_email", principal, token
+                    )
+                    return principal, token
+        return None, None
+
     async def reset_password(
         self, session: AsyncSession, token: str, new_password: str
     ) -> bool:
         """Reset password using versioned token with atomic compare-and-swap update."""
-        payload = self.token_signer.verify_token(token)
+        from fastapi_accounts.security.tokens import KeyKind
+
+        payload, key_kind = self.token_signer.verify_token_with_kind(token)
         if (
             not payload
+            or key_kind != KeyKind.DERIVED
+            or payload.get("token_v") != 2
             or payload.get("action") != "reset_password"
             or "sub" not in payload
         ):
@@ -208,7 +251,6 @@ class AccountService:
 
         cred_v = payload.get("cred_v")
         if type(cred_v) is not int or cred_v < 1:
-            # Reject missing, non-int (e.g. bool), or non-positive cred_v
             return False
 
         # Compute hash off-loop BEFORE DB transaction
@@ -278,8 +320,13 @@ class AccountService:
         self, session: AsyncSession, token: str
     ) -> UserPrincipal | None:
         """Validate email verification token and mark address verified."""
-        payload = self.token_signer.verify_token(token)
+        from fastapi_accounts.security.tokens import KeyKind
+
+        payload, key_kind = self.token_signer.verify_token_with_kind(token)
         if not payload or payload.get("action") != "verify_email":
+            return None
+
+        if key_kind == KeyKind.RAW_FALLBACK and not self.allow_legacy_tokens:
             return None
 
         email = payload.get("email")
@@ -296,7 +343,9 @@ class AccountService:
             user = await self.store.get_user_by_id(session, email_rec.user_id)
             if not user:
                 return None
-            return _to_principal(user, email_rec.email, is_verified=True)
+            return _to_principal(
+                user, email_rec.email, is_verified=True, email_record=email_rec
+            )
         except Exception:
             await session.rollback()
             raise

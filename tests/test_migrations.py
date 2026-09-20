@@ -401,3 +401,28 @@ def test_env_py_loads_database_url_from_env(monkeypatch: pytest.MonkeyPatch):
         alembic_cfg = get_alembic_config()
         command.upgrade(alembic_cfg, "head")
         command.check(alembic_cfg)
+
+
+def test_migration_0004_rejects_pre_existing_drift():
+    """Verify that upgrading a managed database from 0003 to 0004 fails closed if credential_version column already exists."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = os.path.join(tmpdir, "drift_test.db")
+        sync_db_url = f"sqlite:///{db_path}"
+        alembic_cfg = get_alembic_config(sync_db_url)
+
+        # Upgrade to 0003
+        command.upgrade(alembic_cfg, "0003_add_session_indexes")
+
+        # Manually add credential_version column out-of-band to simulate schema drift
+        engine = create_engine(sync_db_url)
+        with engine.connect() as conn:
+            conn.execute(
+                text(
+                    "ALTER TABLE password_credentials ADD COLUMN credential_version INTEGER DEFAULT 1"
+                )
+            )
+            conn.commit()
+
+        # Upgrading to head (0004) must fail closed with RuntimeError
+        with pytest.raises(RuntimeError, match="Schema drift detected"):
+            command.upgrade(alembic_cfg, "head")

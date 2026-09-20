@@ -47,7 +47,7 @@ Please do not open public GitHub issues or discussions for undisclosed vulnerabi
 4. **Abuse & Rate Limiting with PII-Safe Hashed Keys (P0 #8):**
    - Sensitive flows (`/login`, `/register`, `/request-password-reset`, `/reset-password`, `/request-verify-email`, `/verify-email`, `/change-password`) are protected by a configurable `BaseRateLimiter`.
    - Rate limit keys use HMAC-SHA256 digests over `action`, normalized identity, and resolved client IP, preventing plaintext PII or IP leakage in storage.
-   - In-memory sliding window limiter bounds memory to 10,000 keys with LRU/expiration eviction. Production multi-worker deployments should configure a distributed Redis limiter or API Gateway.
+   - The default `InMemorySlidingWindowLimiter` is single-process and bounds memory up to `max_keys=10000` entries via LRU and window expiration purge. Under adversarial key churn exceeding capacity, it evicts least-recently-used records. For distributed/multi-worker deployments or adversarial internet scale, configure a distributed rate limiter (e.g. Redis) or reverse proxy / API gateway.
 
 5. **Request-Scoped Session & Principal Isolation (P0 #11):**
    - Current user dependencies capture `db: AsyncSession = Depends(adapter.get_db)`, strictly honoring FastAPI's `app.dependency_overrides`.
@@ -61,3 +61,4 @@ Please do not open public GitHub issues or discussions for undisclosed vulnerabi
    - Production secrets require $\ge 32$ cryptographically random bytes (256 bits entropy, e.g. via `secrets.token_urlsafe(32)`).
    - Domain keys are derived via HMAC-SHA256 for auth tokens, CSRF tokens, and rate-limit hashing.
    - `TimedTokenSigner` supports zero-downtime key rotation using `Sequence[str]`.
+   - Legacy raw fallback tokens (`token_v=1`) are disabled by default and restricted exclusively to `verify_email` via explicit opt-in (`allow_legacy_tokens=True`). Legacy token support is deprecated and scheduled for complete removal in `v0.2.0` (sunset date: 2026-12-31). Password reset tokens strictly reject legacy raw tokens under all configurations.

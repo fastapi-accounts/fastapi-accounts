@@ -13,13 +13,17 @@ from fastapi_accounts import (
 # 1. Initialize the adapter and account engine
 # In production, set cookie_secure=True (default) and pass secret_key via environment variable:
 # export FASTAPI_ACCOUNTS_SECRET_KEY=$(openssl rand -hex 32)
+secret_key = os.environ.get("FASTAPI_ACCOUNTS_SECRET_KEY")
+if not secret_key:
+    raise RuntimeError(
+        "Missing environment variable FASTAPI_ACCOUNTS_SECRET_KEY. "
+        "Generate a strong 32+ byte secret: export FASTAPI_ACCOUNTS_SECRET_KEY=$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+    )
+
 adapter = SQLAlchemyAdapter(database_url="sqlite+aiosqlite:///./example_accounts.db")
 accounts = FastAPIAccounts(
     adapter=adapter,
-    secret_key=os.environ.get(
-        "FASTAPI_ACCOUNTS_SECRET_KEY",
-        "dev-secret-key-must-be-at-least-32-chars-long-change-in-prod-1234567890",
-    ),
+    secret_key=secret_key,
     # Note: cookie_secure=False is used here for plain HTTP local testing. In production, leave cookie_secure=True (default).
     transport=CookieTransport(cookie_secure=False),
 )

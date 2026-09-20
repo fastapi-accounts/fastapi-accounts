@@ -131,15 +131,28 @@ With the core vertical slice validated, we immediately tackled the most critical
 
 ---
 
+## 🛡️ Chapter 8: Phase 1 Hardening (`v0.1.0a5`) — Rigorous Security Audits
+
+In late September 2026, we subjected the entire codebase to an exhaustive P0 security and architecture audit. Rather than papering over edge cases, we re-architected the system to deliver bank-grade guarantees:
+
+1. **Monotonic Credential Versioning with CAS:** Password mutations utilize atomic SQL Compare-and-Swap on `credential_version >= 1`, guaranteeing replay immunity even under frozen system clocks.
+2. **Asynchronous Bounded Argon2id Hashing:** Offloaded password hashing to worker threads bounded by concurrency limiters with length bounds and constant-time dummy verification.
+3. **Session-Bound Double-Submit CSRF:** Isolated pre-auth and session-bound CSRF lifecycles with strict host-exact `Origin`/`Referer` validation.
+4. **Service / Store Separation & Observable Transactions:** Complete architectural separation with pure stores, service-owned transaction boundaries, and error-contained post-commit callbacks.
+5. **Deterministic Migration Lineage & Fingerprinted Adoption:** Full Alembic migration suite (0001-0004) with synchronous `psycopg` PostgreSQL CI execution and structural schema fingerprinting.
+
+---
+
 ## 🗺️ What's Next on the Horizon
 
 We are building this project **100% in the open**, maintaining radical simplicity and rock-solid security invariants.
 
 Our updated roadmap:
-- [x] **v0.1.0-alpha (Shipped):** Core Email/Password, Email Verification lifecycle, Session Management, Dual Transports (Cookie + Bearer), Password Reset & Recovery, Authenticated Password Change.
+- [x] **v0.1.0-alpha (Shipped & Hardened):** Core Email/Password, Email Verification lifecycle, Session Management, Dual Transports (Cookie + Bearer), Password Reset & Recovery, Authenticated Password Change, CSRF & Rate Limiting Hardening, Alembic Migrations.
 - [ ] **v0.2.0 (Multi-Email & DB Matrix):**
   - Multi-email management (adding secondary emails, verification, promoting to primary).
-  - PostgreSQL & MySQL integration tests running in CI alongside SQLite.
+  - MySQL integration tests running in CI alongside SQLite and PostgreSQL.
+  - Full sunset of legacy fallback tokens (2026-12-31).
 - [ ] **v0.3.0 (First Social Provider):**
   - Google OAuth2/OIDC integration with anti-takeover verification checks.
 - [ ] **Future Horizons (Community-Driven):**
@@ -148,4 +161,5 @@ Our updated roadmap:
 We believe open source thrives on honesty, community collaboration, and relentless focus on developer experience. 
 
 If you want to help shape the future of authentication in FastAPI, join our [GitHub Discussions](https://github.com/fastapi-accounts/fastapi-accounts/discussions) and build with us! 🚀
+
 

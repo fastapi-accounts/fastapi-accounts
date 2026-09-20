@@ -57,14 +57,59 @@ jobs:
 
       - name: Build Wheel and Source Distribution
         run: |
-          python -m build --no-build-isolation
+          rm -rf dist build *.egg-info
+          python -m build
           twine check dist/*
 
-      - name: Isolated Wheel Smoke Test
+      - name: Isolated Wheel Smoke Test & Migration Execution
         run: |
           python -m venv test_venv
           ./test_venv/bin/pip install --upgrade pip
-          ./test_venv/bin/pip install dist/*.whl
+          WHEELS=(dist/*.whl)
+          if [ ${#WHEELS[@]} -ne 1 ]; then echo "Expected exactly 1 wheel, found ${#WHEELS[@]}"; exit 1; fi
+          WHEEL_PATH="${WHEELS[0]}"
+          
+          # 1. Test core-only installation
+          ./test_venv/bin/pip install "$WHEEL_PATH"
           ./test_venv/bin/python -c "import fastapi_accounts; print('Core import OK:', fastapi_accounts.__version__)"
-          ./test_venv/bin/pip install dist/*.whl[sqlite,migrations]
-          ./test_venv/bin/python -c "import fastapi_accounts.migrations; print('Migrations OK')"
+          
+          # 2. Test extras installation, fresh migration, and legacy adoption in clean working directory
+          ./test_venv/bin/pip install "${WHEEL_PATH}[sqlite,postgres,migrations]"
+          TMP_TEST_DIR=$(mktemp -d)
+          cd "$TMP_TEST_DIR"
+          "$GITHUB_WORKSPACE/test_venv/bin/python" -c "
+          import uuid
+          from datetime import datetime, timezone
+          import sqlalchemy as sa
+          from sqlalchemy import create_engine
+          from alembic import command
+          from fastapi_accounts.migrations import get_alembic_config, SchemaState, inspect_legacy_schema
+
+          # A. Fresh database upgrade & check
+          cfg = get_alembic_config('sqlite:///./fresh_wheel_test.db')
+          command.upgrade(cfg, 'head')
+          command.check(cfg)
+          print('Fresh upgrade & check OK')
+
+          # B. Legacy adoption test on unmanaged schema
+          engine = create_engine('sqlite:///./legacy_a3_wheel_test.db')
+          meta = sa.MetaData()
+          sa.Table('users', meta, sa.Column('id', sa.Uuid(), primary_key=True), sa.Column('is_active', sa.Boolean(), nullable=False), sa.Column('is_superuser', sa.Boolean(), nullable=False), sa.Column('created_at', sa.DateTime(timezone=True), nullable=False), sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False))
+          sa.Table('email_addresses', meta, sa.Column('id', sa.Uuid(), primary_key=True), sa.Column('user_id', sa.Uuid(), sa.ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True), sa.Column('email', sa.String(320), nullable=False, unique=True, index=True), sa.Column('is_verified', sa.Boolean(), nullable=False), sa.Column('is_primary', sa.Boolean(), nullable=False), sa.Column('created_at', sa.DateTime(timezone=True), nullable=False))
+          sa.Table('password_credentials', meta, sa.Column('id', sa.Uuid(), primary_key=True), sa.Column('user_id', sa.Uuid(), sa.ForeignKey('users.id', ondelete='CASCADE'), nullable=False, unique=True, index=True), sa.Column('hashed_password', sa.String(1024), nullable=False), sa.Column('password_updated_at', sa.DateTime(timezone=True), nullable=False), sa.Column('created_at', sa.DateTime(timezone=True), nullable=False), sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False))
+          sa.Table('sessions', meta, sa.Column('id', sa.String(64), primary_key=True), sa.Column('user_id', sa.Uuid(), sa.ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True), sa.Column('created_at', sa.DateTime(timezone=True), nullable=False), sa.Column('expires_at', sa.DateTime(timezone=True), nullable=False, index=True), sa.Column('ip_address', sa.String(45), nullable=True), sa.Column('user_agent', sa.String(512), nullable=True))
+          meta.create_all(engine)
+
+          with engine.connect() as conn:
+              res = inspect_legacy_schema(conn)
+              assert res.state == SchemaState.UNVERSIONED_A3
+              assert res.stamp_revision == '0003_add_session_indexes'
+
+          cfg_legacy = get_alembic_config('sqlite:///./legacy_a3_wheel_test.db')
+          command.stamp(cfg_legacy, res.stamp_revision)
+          command.upgrade(cfg_legacy, 'head')
+          command.check(cfg_legacy)
+          print('Legacy adoption upgrade & check OK')
+          "
+          rm -rf "$TMP_TEST_DIR"
+

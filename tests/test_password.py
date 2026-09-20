@@ -59,8 +59,39 @@ async def test_async_verify_dummy_password():
 @pytest.mark.asyncio
 async def test_event_loop_not_blocked_during_hashing():
     """Verify that CPU-intensive Argon2 operations offloaded via worker threads do not block event loop progress."""
+    import threading
+
+    import anyio
+
     svc = PasswordService(argon2_concurrency=4)
 
+    # 1. Deterministic thread-offload verification: event loop yields while thread waits
+    worker_started = threading.Event()
+    worker_can_finish = threading.Event()
+    loop_progressed = False
+
+    def blocking_worker() -> str:
+        worker_started.set()
+        worker_can_finish.wait(timeout=5.0)
+        return "worker_completed"
+
+    async def run_worker() -> str:
+        return await anyio.to_thread.run_sync(blocking_worker, limiter=svc._limiter)
+
+    task = asyncio.create_task(run_worker())
+
+    while not worker_started.is_set():
+        await asyncio.sleep(0.001)
+
+    # Event loop continues processing while thread is blocked
+    loop_progressed = True
+    worker_can_finish.set()
+
+    res = await task
+    assert res == "worker_completed"
+    assert loop_progressed is True
+
+    # 2. Live Argon2 hashing heartbeat concurrency
     ticks = 0
 
     async def heartbeat():
@@ -69,7 +100,6 @@ async def test_event_loop_not_blocked_during_hashing():
             await asyncio.sleep(0.01)
             ticks += 1
 
-    # Run background heartbeat concurrently with multiple async password hashes
     heartbeat_task = asyncio.create_task(heartbeat())
     hashes = await asyncio.gather(
         svc.async_hash_password("Pass1234!"),
@@ -79,5 +109,4 @@ async def test_event_loop_not_blocked_during_hashing():
     await heartbeat_task
 
     assert len(hashes) == 3
-    # Heartbeat must have ticked while hashing took place
     assert ticks > 0

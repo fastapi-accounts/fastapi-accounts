@@ -84,10 +84,7 @@ from fastapi_accounts import (
 adapter = SQLAlchemyAdapter(database_url="sqlite+aiosqlite:///./accounts.db")
 accounts = FastAPIAccounts(
     adapter=adapter,
-    secret_key=os.environ.get(
-        "FASTAPI_ACCOUNTS_SECRET_KEY",
-        "dev-secret-key-must-be-at-least-32-chars-long-change-in-prod-1234567890",
-    ),
+    secret_key=os.environ["FASTAPI_ACCOUNTS_SECRET_KEY"],
     # For local development without HTTPS, set cookie_secure=False:
     transport=CookieTransport(cookie_secure=False),
 )

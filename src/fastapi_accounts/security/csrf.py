@@ -6,10 +6,18 @@ import hmac
 import json
 import secrets
 import time
+from enum import Enum
 from typing import Any
 from urllib.parse import urlparse
 
 from fastapi import Request
+
+
+class CSRFContext(str, Enum):
+    PRE_AUTH = "pre_auth"
+    SESSION_BOUND = "session_bound"
+    DUAL_MODE = "dual_mode"
+    LOGOUT = "logout"
 
 
 def _sign_payload(payload: dict[str, Any], signing_key: bytes) -> str:
@@ -80,8 +88,9 @@ def validate_csrf_token(
     header_token: str | None,
     current_session_id: str | None,
     signing_key: bytes,
+    expected_context: CSRFContext = CSRFContext.DUAL_MODE,
 ) -> bool:
-    """Validate double-submit CSRF tokens and session binding."""
+    """Validate double-submit CSRF tokens and enforce strict route context."""
     if not cookie_token or not header_token:
         return False
 
@@ -92,14 +101,32 @@ def validate_csrf_token(
     if not payload:
         return False
 
-    # If active session exists, token MUST be a session token bound to this exact session_id
-    if current_session_id is not None:
+    token_type = payload.get("type")
+    token_sid = payload.get("sid")
+
+    if expected_context == CSRFContext.PRE_AUTH:
+        return token_type == "pre_auth" and token_sid is None
+
+    if expected_context == CSRFContext.SESSION_BOUND:
         return (
-            payload.get("type") == "session"
-            and payload.get("sid") == current_session_id
+            token_type == "session"
+            and current_session_id is not None
+            and token_sid == current_session_id
         )
 
-    return True
+    if expected_context == CSRFContext.DUAL_MODE:
+        if current_session_id is not None:
+            return token_type == "session" and token_sid == current_session_id
+        else:
+            return token_type == "pre_auth" and token_sid is None
+
+    if expected_context == CSRFContext.LOGOUT:
+        if current_session_id is not None:
+            return token_type == "session" and token_sid == current_session_id
+        else:
+            return token_type == "pre_auth" and token_sid is None
+
+    return False
 
 
 def validate_origin_header(

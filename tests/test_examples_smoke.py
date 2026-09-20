@@ -1,5 +1,12 @@
+import os
+
 import pytest
 from httpx import ASGITransport, AsyncClient
+
+os.environ.setdefault(
+    "FASTAPI_ACCOUNTS_SECRET_KEY",
+    "strong-test-secret-key-32-chars-long-for-smoke-testing-only-12345",
+)
 
 from examples.basic_app import app
 

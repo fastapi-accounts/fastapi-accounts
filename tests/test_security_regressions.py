@@ -465,3 +465,267 @@ async def test_seven_routes_parameterized_rate_limiting(
         res3 = await client.post(route, json=payload, headers=headers)
         assert res3.status_code == 429
         assert "Retry-After" in res3.headers
+
+
+@pytest.mark.asyncio
+async def test_change_password_rate_limiting_authenticated(adapter: SQLAlchemyAdapter):
+    """P0 #8: Verify /change-password route rate limiting for authenticated sessions."""
+    accounts = FastAPIAccounts(
+        adapter=adapter,
+        secret_key="rate-limit-secret-key-at-least-32-chars-long",
+        transport=CookieTransport(cookie_secure=False),
+        allowed_origins=["http://test"],
+    )
+    accounts.change_password_rate_limit = (2, 60)
+
+    app = FastAPI()
+    app.include_router(accounts.router, prefix="/api/v1/auth")
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # Bootstrap CSRF
+        csrf_init = await client.get("/api/v1/auth/csrf")
+        pre_csrf = csrf_init.json()["csrf_token"]
+        pre_headers = {"Origin": "http://test", "X-CSRF-Token": pre_csrf}
+
+        # Register and Login
+        reg = await client.post(
+            "/api/v1/auth/register",
+            json={"email": "cp_rate@example.com", "password": "Password123!"},
+            headers=pre_headers,
+        )
+        assert reg.status_code == 201
+
+        login = await client.post(
+            "/api/v1/auth/login",
+            json={"email": "cp_rate@example.com", "password": "Password123!"},
+            headers=pre_headers,
+        )
+        assert login.status_code == 200
+        csrf_tok = client.cookies.get("fastapi_accounts_csrf")
+        assert csrf_tok is not None
+        headers = {"Origin": "http://test", "X-CSRF-Token": csrf_tok}
+
+        # Attempt 1: wrong password, counts towards limit
+        r1 = await client.post(
+            "/api/v1/auth/change-password",
+            json={
+                "current_password": "WrongPassword1!",
+                "new_password": "NewPassword123!",
+            },
+            headers=headers,
+        )
+        assert r1.status_code == 400
+
+        # Attempt 2: wrong password, counts towards limit
+        r2 = await client.post(
+            "/api/v1/auth/change-password",
+            json={
+                "current_password": "WrongPassword2!",
+                "new_password": "NewPassword123!",
+            },
+            headers=headers,
+        )
+        assert r2.status_code == 400
+
+        # Attempt 3: exceeds limit -> 429 Too Many Requests
+        r3 = await client.post(
+            "/api/v1/auth/change-password",
+            json={
+                "current_password": "Password123!",
+                "new_password": "NewPassword123!",
+            },
+            headers=headers,
+        )
+        assert r3.status_code == 429
+        assert "Retry-After" in r3.headers
+
+
+@pytest.mark.asyncio
+async def test_in_memory_sliding_window_limiter_capacity_and_multi_window():
+    """P0 #8: Verify rate limiter capacity eviction preserves existing keys and handles distinct window durations."""
+    from fastapi_accounts.security.rate_limiter import InMemorySlidingWindowLimiter
+
+    limiter = InMemorySlidingWindowLimiter(max_keys=2)
+
+    # 1. Capacity eviction must NOT reset an existing key's exhausted quota
+    # Exhaust quota on key1 (max 1 req per hour)
+    ok1, _ = await limiter.check_rate_limit("key1", max_requests=1, window_seconds=3600)
+    assert ok1 is True
+    ok1_exhausted, _ = await limiter.check_rate_limit(
+        "key1", max_requests=1, window_seconds=3600
+    )
+    assert ok1_exhausted is False
+
+    # Insert key2 (reaches capacity=2)
+    ok2, _ = await limiter.check_rate_limit("key2", max_requests=1, window_seconds=3600)
+    assert ok2 is True
+
+    # Re-checking key1 at capacity must still be rejected (NOT evicted and reset!)
+    ok1_recheck, _ = await limiter.check_rate_limit(
+        "key1", max_requests=1, window_seconds=3600
+    )
+    assert ok1_recheck is False
+
+    # Inserting key3 forces LRU eviction of key2 (since key1 was accessed more recently)
+    ok3, _ = await limiter.check_rate_limit("key3", max_requests=1, window_seconds=3600)
+    assert ok3 is True
+    # key2 was evicted; key1 is still retained and still exhausted
+    ok1_still_exhausted, _ = await limiter.check_rate_limit(
+        "key1", max_requests=1, window_seconds=3600
+    )
+    assert ok1_still_exhausted is False
+
+    # 2. Multi-window cross-talk isolation
+    limiter_multi = InMemorySlidingWindowLimiter(max_keys=10)
+    # k_long has a 1-hour window
+    ok_long1, _ = await limiter_multi.check_rate_limit(
+        "k_long", max_requests=1, window_seconds=3600
+    )
+    assert ok_long1 is True
+    ok_long2, _ = await limiter_multi.check_rate_limit(
+        "k_long", max_requests=1, window_seconds=3600
+    )
+    assert ok_long2 is False
+
+    # k_short has a 0.05-second window
+    ok_short1, _ = await limiter_multi.check_rate_limit(
+        "k_short", max_requests=1, window_seconds=1
+    )
+    assert ok_short1 is True
+
+    # k_long MUST NOT have been purged by k_short!
+    ok_long3, _ = await limiter_multi.check_rate_limit(
+        "k_long", max_requests=1, window_seconds=3600
+    )
+    assert ok_long3 is False
+
+
+def test_resolve_client_ip_trusted_proxy():
+    """P0 #8: Verify right-to-left untrusted proxy resolution."""
+    from starlette.datastructures import Headers
+
+    from fastapi_accounts.security.rate_limiter import resolve_client_ip
+
+    class DummyClient:
+        def __init__(self, host: str):
+            self.host = host
+
+    class DummyRequest:
+        def __init__(self, client_host: str, headers_dict: dict[str, str]):
+            self.client = DummyClient(client_host)
+            self.headers = Headers(headers_dict)
+
+    # 1. Zero trusted proxies: always returns client.host, ignoring X-Forwarded-For
+    req0 = DummyRequest("10.0.0.1", {"x-forwarded-for": "198.51.100.1, 203.0.113.195"})
+    assert resolve_client_ip(req0, trusted_proxy_count=0) == "10.0.0.1"
+
+    # 2. One trusted proxy: client.host (10.0.0.1) is proxy, client is 203.0.113.195
+    req1 = DummyRequest("10.0.0.1", {"x-forwarded-for": "198.51.100.1, 203.0.113.195"})
+    assert resolve_client_ip(req1, trusted_proxy_count=1) == "203.0.113.195"
+
+    # 3. Two trusted proxies: client is 198.51.100.1
+    req2 = DummyRequest("10.0.0.1", {"x-forwarded-for": "198.51.100.1, 203.0.113.195"})
+    assert resolve_client_ip(req2, trusted_proxy_count=2) == "198.51.100.1"
+
+
+@pytest.mark.asyncio
+async def test_csrf_cross_type_and_session_ab_isolation(
+    cookie_accounts: FastAPIAccounts,
+):
+    """P0 #7: Cross-type CSRF token rejection and session A/B isolation."""
+    assert isinstance(cookie_accounts.transport, CookieTransport)
+    cookie_accounts.transport.csrf_protect = True
+    app = FastAPI()
+    app.include_router(cookie_accounts.router, prefix="/api/v1/auth")
+
+    transport = ASGITransport(app=app)
+    async with (
+        AsyncClient(transport=transport, base_url="http://test") as client_a,
+        AsyncClient(transport=transport, base_url="http://test") as client_b,
+    ):
+        # Bootstrap pre-auth CSRF for both clients
+        csrf_init_a = await client_a.get("/api/v1/auth/csrf")
+        pre_auth_csrf_a = csrf_init_a.json()["csrf_token"]
+
+        csrf_init_b = await client_b.get("/api/v1/auth/csrf")
+        pre_auth_csrf_b = csrf_init_b.json()["csrf_token"]
+
+        # Register User A and User B
+        await client_a.post(
+            "/api/v1/auth/register",
+            json={"email": "user_a@example.com", "password": "PasswordA123!"},
+            headers={"Origin": "http://test", "X-CSRF-Token": pre_auth_csrf_a},
+        )
+        await client_b.post(
+            "/api/v1/auth/register",
+            json={"email": "user_b@example.com", "password": "PasswordB123!"},
+            headers={"Origin": "http://test", "X-CSRF-Token": pre_auth_csrf_b},
+        )
+
+        # Login User A
+        login_a = await client_a.post(
+            "/api/v1/auth/login",
+            json={"email": "user_a@example.com", "password": "PasswordA123!"},
+            headers={"Origin": "http://test", "X-CSRF-Token": pre_auth_csrf_a},
+        )
+        assert login_a.status_code == 200
+        csrf_a = client_a.cookies.get("fastapi_accounts_csrf")
+        assert csrf_a is not None
+
+        # Login User B
+        login_b = await client_b.post(
+            "/api/v1/auth/login",
+            json={"email": "user_b@example.com", "password": "PasswordB123!"},
+            headers={"Origin": "http://test", "X-CSRF-Token": pre_auth_csrf_b},
+        )
+        assert login_b.status_code == 200
+        csrf_b = client_b.cookies.get("fastapi_accounts_csrf")
+        assert csrf_b is not None
+
+        # 1. User A sends session B's CSRF token -> 403 Forbidden
+        cross_csrf_resp = await client_a.post(
+            "/api/v1/auth/change-password",
+            json={
+                "current_password": "PasswordA123!",
+                "new_password": "NewPasswordA456!",
+            },
+            headers={"Origin": "http://test", "X-CSRF-Token": csrf_b},
+        )
+        assert cross_csrf_resp.status_code == 403
+
+        # 2. User A sends pre-auth CSRF token to authenticated mutation -> 403 Forbidden
+        pre_auth_on_auth_resp = await client_a.post(
+            "/api/v1/auth/change-password",
+            json={
+                "current_password": "PasswordA123!",
+                "new_password": "NewPasswordA456!",
+            },
+            headers={"Origin": "http://test", "X-CSRF-Token": pre_auth_csrf_a},
+        )
+        assert pre_auth_on_auth_resp.status_code == 403
+
+        # 3. User A sends valid CSRF token -> 200 OK
+        valid_resp = await client_a.post(
+            "/api/v1/auth/change-password",
+            json={
+                "current_password": "PasswordA123!",
+                "new_password": "NewPasswordA456!",
+            },
+            headers={"Origin": "http://test", "X-CSRF-Token": csrf_a},
+        )
+        assert valid_resp.status_code == 200
+
+        # 4. User A logs out (idempotent POST /logout)
+        logout1 = await client_a.post(
+            "/api/v1/auth/logout",
+            headers={"Origin": "http://test", "X-CSRF-Token": csrf_a},
+        )
+        assert logout1.status_code == 200
+
+        # Second logout is safe and idempotent
+        logout2 = await client_a.post("/api/v1/auth/logout")
+        assert logout2.status_code == 200
+
+        # Calling /me is now 401 Unauthorized
+        assert (await client_a.get("/api/v1/auth/me")).status_code == 401

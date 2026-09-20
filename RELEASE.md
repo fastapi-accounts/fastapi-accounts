@@ -54,12 +54,12 @@ Update the version number in **both** locations:
    ```toml
    [project]
    name = "fastapi-accounts"
-   version = "0.1.0a2"   # <-- Update version string
+   version = "0.1.0a5"   # <-- Update version string
    ```
 
 2. **`src/fastapi_accounts/__init__.py`**:
    ```python
-   __version__ = "0.1.0a2"  # <-- Match version string
+   __version__ = "0.1.0a5"  # <-- Match version string
    ```
 
 ---
@@ -170,10 +170,10 @@ Once verified on PyPI, tag the release commit in git:
 
 ```bash
 # 1. Create annotated tag
-git tag -a v0.1.0a2 -m "Release v0.1.0a2: Password reset and change password workflows"
+git tag -a v0.1.0a5 -m "Release v0.1.0a5: Hardened security, monotonic reset, async bounded hashing, and migration lineage"
 
 # 2. Push tag to GitHub
-git push origin v0.1.0a2
+git push origin v0.1.0a5
 ```
 
 Then, visit [GitHub Releases](https://github.com/fastapi-accounts/fastapi-accounts/releases/new) to create a release pointing to the new tag with change highlights.

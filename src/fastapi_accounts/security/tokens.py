@@ -5,6 +5,7 @@ import json
 import secrets
 import time
 from collections.abc import Sequence
+from enum import Enum
 from typing import Any
 
 WEAK_SECRET_PLACEHOLDERS = {
@@ -13,7 +14,17 @@ WEAK_SECRET_PLACEHOLDERS = {
     "12345678901234567890123456789012",
     "abcdefghijklmnopqrstuvwxyz123456",
     "your-secret-key-here-must-be-32-bytes",
+    "dev-secret-key-must-be-at-least-32-chars-long-change-in-prod-1234567890",
+    "change-this-to-a-secure-random-secret-key-in-production-min-32-chars",
+    "test_secret_key_at_least_32_bytes_long_1234567890",
+    "secret-key-must-be-at-least-32-chars-long-for-tests-1234567890",
+    "temporary-secret-key-do-not-use-in-production-0123456789",
 }
+
+
+class KeyKind(str, Enum):
+    DERIVED = "derived"
+    RAW_FALLBACK = "raw_fallback"
 
 
 def derive_key(secret: str, domain: bytes) -> bytes:
@@ -85,12 +96,14 @@ class TimedTokenSigner:
 
         return f"{payload_b64}.{sig_b64}"
 
-    def verify_token(self, token: str) -> dict[str, Any] | None:
-        """Verify the signature across all active keys and check expiration. Returns payload or None."""
+    def verify_token_with_kind(
+        self, token: str
+    ) -> tuple[dict[str, Any] | None, KeyKind | None]:
+        """Verify the signature across all active keys and check expiration. Returns (payload, KeyKind) or (None, None)."""
         try:
             parts = token.split(".")
             if len(parts) != 2:
-                return None
+                return None, None
 
             payload_b64, sig_b64 = parts
 
@@ -101,25 +114,25 @@ class TimedTokenSigner:
             payload_bytes = payload_b64.encode("utf-8")
 
             # Try derived keys first (for current/rotated keys)
-            matched = False
+            key_kind: KeyKind | None = None
             for d_key in self._derived_keys:
                 expected_sig = hmac.new(d_key, payload_bytes, hashlib.sha256).digest()
                 if hmac.compare_digest(expected_sig, actual_sig):
-                    matched = True
+                    key_kind = KeyKind.DERIVED
                     break
 
             # Fallback to raw keys for legacy token compatibility
-            if not matched:
+            if key_kind is None:
                 for r_key in self._raw_keys:
                     expected_sig = hmac.new(
                         r_key, payload_bytes, hashlib.sha256
                     ).digest()
                     if hmac.compare_digest(expected_sig, actual_sig):
-                        matched = True
+                        key_kind = KeyKind.RAW_FALLBACK
                         break
 
-            if not matched:
-                return None
+            if key_kind is None:
+                return None, None
 
             # Decode payload
             payload_rem = len(payload_b64) % 4
@@ -132,9 +145,13 @@ class TimedTokenSigner:
 
             # Check expiration
             if data.get("exp", 0) < time.time():
-                return None
+                return None, None
 
-            return data
+            # Invariant: v2 tokens MUST use derived signature; reject raw legacy key for v2 fail-closed
+            if key_kind == KeyKind.RAW_FALLBACK and data.get("token_v") == 2:
+                return None, None
+
+            return data, key_kind
         except (
             ValueError,
             KeyError,
@@ -142,4 +159,9 @@ class TimedTokenSigner:
             json.JSONDecodeError,
             UnicodeDecodeError,
         ):
-            return None
+            return None, None
+
+    def verify_token(self, token: str) -> dict[str, Any] | None:
+        """Verify the signature and expiration, returning the payload dictionary if valid, or None."""
+        payload, _ = self.verify_token_with_kind(token)
+        return payload

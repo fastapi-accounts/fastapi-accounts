@@ -18,8 +18,12 @@ POSTGRES_URL = os.environ.get("TEST_POSTGRES_URL")
 @pytest.mark.asyncio
 async def test_postgres_migration_and_cas_concurrency():
     """Verify PostgreSQL migrations to head with zero drift and physical concurrent CAS updates."""
-    # Convert async url to sync for Alembic if needed
-    sync_pg_url = POSTGRES_URL.replace("+asyncpg", "")
+    # Convert asyncpg url to synchronous psycopg v3 driver for Alembic
+    sync_pg_url = (
+        POSTGRES_URL.replace("postgresql+asyncpg://", "postgresql+psycopg://")
+        if "+asyncpg" in POSTGRES_URL
+        else POSTGRES_URL.replace("postgresql://", "postgresql+psycopg://")
+    )
 
     alembic_cfg = get_alembic_config(sync_pg_url)
     command.upgrade(alembic_cfg, "head")
@@ -43,14 +47,19 @@ async def test_postgres_migration_and_cas_concurrency():
         user_id = user.id
 
     # Two separate worker connections performing CAS update with expected_cred_v=1
-    async def worker_cas(new_hash: str):
+    async def worker_cas(new_hash: str) -> tuple[bool, str | None]:
         async with session_maker() as s:
-            return await adapter.atomic_reset_password(
+            ok = await adapter.atomic_reset_password(
                 session=s,
                 user_id=user_id,
                 expected_cred_v=1,
                 new_hashed_password=new_hash,
             )
+            if ok:
+                await s.commit()
+            else:
+                await s.rollback()
+            return ok, new_hash if ok else None
 
     results = await asyncio.gather(
         worker_cas("$argon2id$win1"),
@@ -58,7 +67,22 @@ async def test_postgres_migration_and_cas_concurrency():
     )
 
     # Exactly one must succeed on real Postgres
-    assert results.count(True) == 1
-    assert results.count(False) == 1
+    successes = [r for r in results if r[0] is True]
+    failures = [r for r in results if r[0] is False]
+    assert len(successes) == 1
+    assert len(failures) == 1
+    winner_hash = successes[0][1]
+
+    # Verify persisted state from a separate 3rd session
+    async with session_maker() as s:
+        cred = await adapter.get_password_credential(s, user_id)
+        assert cred is not None
+        assert cred.credential_version == 2
+        assert cred.hashed_password == winner_hash
+
+    # Verify complete downgrade to base and re-upgrade to head
+    command.downgrade(alembic_cfg, "base")
+    command.upgrade(alembic_cfg, "head")
+    command.check(alembic_cfg)
 
     await engine.dispose()

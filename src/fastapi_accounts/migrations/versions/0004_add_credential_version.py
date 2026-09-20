@@ -24,32 +24,36 @@ def upgrade() -> None:
         item["name"] for item in inspector.get_columns("password_credentials")
     }
 
-    if "credential_version" not in existing_columns:
-        with op.batch_alter_table("password_credentials") as batch_op:
-            batch_op.add_column(
-                sa.Column(
-                    "credential_version",
-                    sa.Integer(),
-                    nullable=True,
-                    server_default="1",
-                )
-            )
-
-        op.execute(
-            "UPDATE password_credentials SET credential_version = 1 WHERE credential_version IS NULL"
+    if "credential_version" in existing_columns:
+        raise RuntimeError(
+            "Schema drift detected: column 'credential_version' already exists in password_credentials table."
         )
 
-        with op.batch_alter_table("password_credentials") as batch_op:
-            batch_op.alter_column(
+    with op.batch_alter_table("password_credentials") as batch_op:
+        batch_op.add_column(
+            sa.Column(
                 "credential_version",
-                nullable=False,
+                sa.Integer(),
+                nullable=True,
                 server_default="1",
-                type_=sa.Integer(),
             )
-            batch_op.create_check_constraint(
-                "ck_password_credentials_credential_version_positive",
-                "credential_version >= 1",
-            )
+        )
+
+    op.execute(
+        "UPDATE password_credentials SET credential_version = 1 WHERE credential_version IS NULL"
+    )
+
+    with op.batch_alter_table("password_credentials") as batch_op:
+        batch_op.alter_column(
+            "credential_version",
+            nullable=False,
+            server_default="1",
+            type_=sa.Integer(),
+        )
+        batch_op.create_check_constraint(
+            "ck_password_credentials_credential_version_positive",
+            "credential_version >= 1",
+        )
 
 
 def downgrade() -> None:

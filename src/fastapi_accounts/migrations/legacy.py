@@ -404,6 +404,25 @@ def inspect_legacy_schema(connection: Connection) -> SchemaInspectionResult:
                         "error": "Missing password_updated_at on current schema",
                     },
                 )
+            try:
+                cks = inspector.get_check_constraints("password_credentials")
+                if cks:
+                    has_cred_v_ck = any(
+                        "credential_version" in (ck.get("sqltext") or "")
+                        or ck.get("name")
+                        == "ck_password_credentials_credential_version_positive"
+                        for ck in cks
+                    )
+                    if not has_cred_v_ck:
+                        return SchemaInspectionResult(
+                            state=SchemaState.UNKNOWN,
+                            details={
+                                "table": "password_credentials",
+                                "error": "Missing credential_version check constraint",
+                            },
+                        )
+            except (NotImplementedError, AttributeError):
+                pass
             return SchemaInspectionResult(
                 state=SchemaState.UNVERSIONED_CURRENT,
                 stamp_revision="0004_add_credential_version",

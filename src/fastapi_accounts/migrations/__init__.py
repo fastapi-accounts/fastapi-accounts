@@ -5,12 +5,15 @@ from __future__ import annotations
 import importlib.resources
 from typing import TYPE_CHECKING
 
+from fastapi_accounts.migrations.legacy import (
+    SchemaInspectionResult,
+    SchemaState,
+)
+
 if TYPE_CHECKING:
     from alembic.config import Config
     from sqlalchemy.engine import Connection
     from sqlalchemy.ext.asyncio import AsyncConnection
-
-    from fastapi_accounts.migrations.legacy import SchemaInspectionResult
 
 
 def get_migrations_directory() -> str:
@@ -56,6 +59,8 @@ async def async_inspect_legacy_schema(
 
 
 __all__ = [
+    "SchemaInspectionResult",
+    "SchemaState",
     "async_inspect_legacy_schema",
     "get_alembic_config",
     "get_migrations_directory",
