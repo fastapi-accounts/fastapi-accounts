@@ -1,4 +1,5 @@
 import asyncio
+import os
 from logging.config import fileConfig
 
 from alembic import context
@@ -16,9 +17,26 @@ if config.config_file_name is not None:
 target_metadata = Base.metadata
 
 
-def run_migrations_offline() -> None:
-    """Run migrations in 'offline' mode."""
+def get_database_url() -> str:
+    """Resolve database URL from config or environment variables."""
     url = config.get_main_option("sqlalchemy.url")
+    if not url:
+        url = (
+            os.environ.get("FASTAPI_ACCOUNTS_DATABASE_URL")
+            or os.environ.get("DATABASE_URL")
+            or ""
+        )
+    return url
+
+
+def run_migrations_offline() -> None:
+    """Run migrations in offline mode."""
+    url = get_database_url()
+    if not url:
+        raise ValueError(
+            "No database URL configured. Specify 'sqlalchemy.url' in alembic.ini "
+            "or set the FASTAPI_ACCOUNTS_DATABASE_URL / DATABASE_URL environment variable."
+        )
     context.configure(
         url=url,
         target_metadata=target_metadata,
@@ -43,9 +61,13 @@ def do_run_migrations(connection: Connection) -> None:
 
 
 async def run_async_migrations() -> None:
-    """Run migrations in 'online' mode with async engine."""
+    """Run migrations in online mode with async engine."""
+    url = get_database_url()
+    section = dict(config.get_section(config.config_ini_section, {}))
+    if url:
+        section["sqlalchemy.url"] = url
     connectable = async_engine_from_config(
-        config.get_section(config.config_ini_section, {}),
+        section,
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
     )
@@ -57,14 +79,20 @@ async def run_async_migrations() -> None:
 
 
 def run_migrations_online() -> None:
-    """Run migrations in 'online' mode."""
+    """Run migrations in online mode."""
     connectable = config.attributes.get("connection", None)
 
     if connectable is not None:
         do_run_migrations(connectable)
         return
 
-    url = config.get_main_option("sqlalchemy.url", "")
+    url = get_database_url()
+    if not url:
+        raise ValueError(
+            "No database URL configured. Specify 'sqlalchemy.url' in alembic.ini "
+            "or set the FASTAPI_ACCOUNTS_DATABASE_URL / DATABASE_URL environment variable."
+        )
+
     if "+aiosqlite" in url or "+asyncpg" in url:
         try:
             loop = asyncio.get_running_loop()
@@ -79,8 +107,10 @@ def run_migrations_online() -> None:
         else:
             asyncio.run(run_async_migrations())
     else:
+        section = dict(config.get_section(config.config_ini_section, {}))
+        section["sqlalchemy.url"] = url
         sync_engine = engine_from_config(
-            config.get_section(config.config_ini_section, {}),
+            section,
             prefix="sqlalchemy.",
             poolclass=pool.NullPool,
         )

@@ -151,6 +151,10 @@ async def test_a01_injected_commit_failure_reset_password(
         )
         assert login_resp.status_code == 200
 
+        # Verify initial session works for /me
+        me_pre = await client.get("/api/v1/auth/me")
+        assert me_pre.status_code == 200
+
         # Generate reset token with valid timestamp
         async with cookie_accounts.adapter.session_maker() as session:
             user = await cookie_accounts.adapter.get_user_by_email(
@@ -183,14 +187,19 @@ async def test_a01_injected_commit_failure_reset_password(
         # Restore commit
         monkeypatch.setattr(AsyncSession, "commit", original_commit)
 
-        # Assert old password still works
+        # Invariant 1: Existing session retained by client remains active and valid
+        me_post = await client.get("/api/v1/auth/me")
+        assert me_post.status_code == 200
+        assert me_post.json()["primary_email"] == "reset_fail@example.com"
+
+        # Invariant 2: Old password still works
         old_login = await client.post(
             "/api/v1/auth/login",
             json={"email": "reset_fail@example.com", "password": "OldPassword123!"},
         )
         assert old_login.status_code == 200
 
-        # Assert new password does NOT work
+        # Invariant 3: New password does NOT work
         new_login = await client.post(
             "/api/v1/auth/login",
             json={"email": "reset_fail@example.com", "password": "NewPassword123!"},
@@ -245,59 +254,87 @@ async def test_a01_injected_commit_failure_login(
 async def test_a01_injected_commit_failure_change_password(
     cookie_accounts: FastAPIAccounts, monkeypatch: pytest.MonkeyPatch
 ):
-    """A01: Injected commit failure during change_password must return 500 and keep old password active."""
+    """A01: Injected commit failure during change_password must return 500 and keep old password and other sessions active."""
     app = FastAPI()
     app.include_router(cookie_accounts.router, prefix="/api/v1/auth")
 
     transport = ASGITransport(app=app, raise_app_exceptions=False)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        # Register and login
-        await client.post(
+    async with AsyncClient(transport=transport, base_url="http://test") as client1:
+        # Register user
+        await client1.post(
             "/api/v1/auth/register",
             json={"email": "change_fail@example.com", "password": "OldPassword123!"},
         )
-        login_resp = await client.post(
+        # Session 1 login
+        login1 = await client1.post(
             "/api/v1/auth/login",
             json={"email": "change_fail@example.com", "password": "OldPassword123!"},
         )
-        assert login_resp.status_code == 200
+        assert login1.status_code == 200
 
-        # Inject commit failure
-        original_commit = AsyncSession.commit
-
-        async def failing_commit(self):
-            raise SQLAlchemyError(
-                "Simulated database failure during change_password commit"
+        # Session 2 login from a separate client
+        async with AsyncClient(transport=transport, base_url="http://test") as client2:
+            login2 = await client2.post(
+                "/api/v1/auth/login",
+                json={
+                    "email": "change_fail@example.com",
+                    "password": "OldPassword123!",
+                },
             )
+            assert login2.status_code == 200
 
-        monkeypatch.setattr(AsyncSession, "commit", failing_commit)
+            # Both sessions valid before change
+            assert (await client1.get("/api/v1/auth/me")).status_code == 200
+            assert (await client2.get("/api/v1/auth/me")).status_code == 200
 
-        ch_resp = await client.post(
-            "/api/v1/auth/change-password",
-            json={
-                "current_password": "OldPassword123!",
-                "new_password": "NewPassword123!",
-                "revoke_other_sessions": True,
-            },
-        )
-        assert ch_resp.status_code == 500
+            # Inject commit failure during change_password with revoke_other_sessions=True
+            original_commit = AsyncSession.commit
 
-        # Restore commit
-        monkeypatch.setattr(AsyncSession, "commit", original_commit)
+            async def failing_commit(self):
+                raise SQLAlchemyError(
+                    "Simulated database failure during change_password commit"
+                )
 
-        # Old password still authenticates
-        old_login = await client.post(
-            "/api/v1/auth/login",
-            json={"email": "change_fail@example.com", "password": "OldPassword123!"},
-        )
-        assert old_login.status_code == 200
+            monkeypatch.setattr(AsyncSession, "commit", failing_commit)
 
-        # New password fails
-        new_login = await client.post(
-            "/api/v1/auth/login",
-            json={"email": "change_fail@example.com", "password": "NewPassword123!"},
-        )
-        assert new_login.status_code == 401
+            ch_resp = await client1.post(
+                "/api/v1/auth/change-password",
+                json={
+                    "current_password": "OldPassword123!",
+                    "new_password": "NewPassword123!",
+                    "revoke_other_sessions": True,
+                },
+            )
+            assert ch_resp.status_code == 500
+
+            # Restore commit
+            monkeypatch.setattr(AsyncSession, "commit", original_commit)
+
+            # Invariant 1: Session 1 remains active
+            assert (await client1.get("/api/v1/auth/me")).status_code == 200
+
+            # Invariant 2: Session 2 remains active (other sessions were NOT revoked)
+            assert (await client2.get("/api/v1/auth/me")).status_code == 200
+
+            # Invariant 3: Old password still authenticates
+            old_login = await client1.post(
+                "/api/v1/auth/login",
+                json={
+                    "email": "change_fail@example.com",
+                    "password": "OldPassword123!",
+                },
+            )
+            assert old_login.status_code == 200
+
+            # Invariant 4: New password fails
+            new_login = await client1.post(
+                "/api/v1/auth/login",
+                json={
+                    "email": "change_fail@example.com",
+                    "password": "NewPassword123!",
+                },
+            )
+            assert new_login.status_code == 401
 
 
 @pytest.mark.asyncio

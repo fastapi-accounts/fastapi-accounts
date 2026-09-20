@@ -124,10 +124,12 @@ You can reference the packaged migrations directly in your `alembic.ini`:
 ```ini
 [alembic]
 script_location = fastapi_accounts:migrations
+sqlalchemy.url = sqlite:///./accounts.db
 ```
 
-Then execute:
+Or provide your database URL via environment variable:
 ```bash
+export FASTAPI_ACCOUNTS_DATABASE_URL="sqlite:///./accounts.db"
 alembic upgrade head
 alembic check
 ```
@@ -151,12 +153,17 @@ If upgrading an existing database initialized with `v0.1.0a2` or `v0.1.0a3` usin
        print(f"Detected schema version: {version}")
    ```
 3. **Apply the appropriate migration path:**
-   * **If `v0.1.0a2`** (lacks `password_updated_at` column):
+   * **If `alembic_managed`** (database is already tracked by Alembic):
+     ```bash
+     # Do NOT stamp; simply upgrade to head
+     alembic upgrade head
+     ```
+   * **If `v0.1.0a2`** (unmanaged baseline lacking `password_updated_at` column):
      ```bash
      alembic stamp 0001_initial_schema
      alembic upgrade head
      ```
-   * **If `v0.1.0a3`** (already contains `password_updated_at` and indexes):
+   * **If `v0.1.0a3`** (unmanaged schema containing `password_updated_at` and indexes):
      ```bash
      alembic stamp head
      ```
@@ -168,7 +175,7 @@ If upgrading an existing database initialized with `v0.1.0a2` or `v0.1.0a3` usin
 
 | Milestone | Target Capabilities | Status |
 | :--- | :--- | :---: |
-| **v0.1.0a4** | Argon2id hashing, Single-use password reset with CAS, Dual-transport (Cookies + Bearer), Async SQLAlchemy 2.0 & Alembic migrations (`fastapi_accounts:migrations`), Fail-safe database commit durability, Sanitized logging & DTO whitelisting | ✅ **Released** |
+| **v0.1.0a4** | Argon2id hashing, Single-use password reset with CAS, Dual-transport (Cookies + Bearer), Async SQLAlchemy 2.0 & Alembic migrations (`fastapi_accounts:migrations`), Fail-safe database commit durability, Sanitized logging & DTO whitelisting | 🎯 **Hardened on `fix/phase1-hardening` (v0.1.0a4 candidate)** |
 | **v0.1.0a5 (Async Performance & DI)** | Offload Argon2id hashing (`anyio.to_thread`), Request-scoped DB session injection, Timing oracle equalization | 🎯 **Next Sprint** |
 | **v0.2.0a1 (Packaging & Typing)** | Complete type annotations, OpenAPI `securitySchemes` authorization in Swagger, Production secure cookie defaults | 📋 Planned |
 | **v0.3.0 (Multi-Email & DB Matrix)** | Secondary email lifecycle & promotion, PostgreSQL service container CI integration matrix | 📋 Planned |

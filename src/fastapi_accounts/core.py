@@ -67,8 +67,8 @@ class FastAPIAccounts:
 
         if not self.secret_key or len(self.secret_key) < 32:
             raise ValueError(
-                "FastAPIAccounts secret_key must be a non-empty string of at least 32 characters (256 bits). "
-                "Generate a secure key using `secrets.token_urlsafe(32)`."
+                "FastAPIAccounts secret_key must be a non-empty string of at least 32 characters. "
+                "Generate a high-entropy secure key using `secrets.token_urlsafe(32)` or `openssl rand -hex 32`."
             )
 
         self.transport = transport or CookieTransport()

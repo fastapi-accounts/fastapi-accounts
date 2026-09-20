@@ -236,9 +236,13 @@ async def test_migration_upgrade_from_0002():
         # Apply up to 0002
         command.upgrade(alembic_cfg, "0002_add_password_updated_at")
 
-        # Verify sessions indexes are currently absent
         sync_engine = create_engine(sync_db_url)
         with sync_engine.connect() as conn:
+            # Invariant: Must be recognized as alembic_managed, NOT misclassified as legacy v0.1.0a3!
+            classification = inspect_legacy_schema(conn)
+            assert classification == "alembic_managed"
+
+            # Verify sessions indexes are currently absent
             inspector = sa.inspect(conn)
             indexes = {idx["name"] for idx in inspector.get_indexes("sessions")}
             assert "ix_sessions_user_id" not in indexes
@@ -285,7 +289,7 @@ def test_migration_downgrade_and_reupgrade():
 
 
 def test_inspect_legacy_schema_outcomes():
-    """Test inspect_legacy_schema across valid and invalid schema states."""
+    """Test inspect_legacy_schema across valid, alembic-managed, and invalid schema states."""
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = os.path.join(tmpdir, "inspect_test.db")
         sync_db_url = f"sqlite:///{db_path}"
@@ -305,19 +309,47 @@ def test_inspect_legacy_schema_outcomes():
             conn.commit()
             assert inspect_legacy_schema(conn) == "unrecognized"
 
-        # 3. Corrupt table (users table missing updated_at) -> unrecognized
+        # 3. Corrupt types (integer email and password fields, nullable sensitive columns, missing unique constraints)
         with engine.connect() as conn:
             conn.execute(text("DROP TABLE users"))
             conn.execute(
-                text("CREATE TABLE users (id CHAR(36) PRIMARY KEY, is_active BOOLEAN)")
+                text(
+                    "CREATE TABLE users (id INTEGER PRIMARY KEY, is_active BOOLEAN, is_superuser BOOLEAN, created_at TIMESTAMP, updated_at TIMESTAMP)"
+                )
             )
-            conn.execute(text("CREATE TABLE email_addresses (id CHAR(36) PRIMARY KEY)"))
             conn.execute(
-                text("CREATE TABLE password_credentials (id CHAR(36) PRIMARY KEY)")
+                text(
+                    "CREATE TABLE email_addresses (id INTEGER PRIMARY KEY, user_id INTEGER, email INTEGER, is_verified BOOLEAN, is_primary BOOLEAN, created_at TIMESTAMP)"
+                )
             )
-            conn.execute(text("CREATE TABLE sessions (id VARCHAR(64) PRIMARY KEY)"))
+            conn.execute(
+                text(
+                    "CREATE TABLE password_credentials (id INTEGER PRIMARY KEY, user_id INTEGER, hashed_password INTEGER, password_updated_at TIMESTAMP, created_at TIMESTAMP, updated_at TIMESTAMP)"
+                )
+            )
+            conn.execute(
+                text(
+                    "CREATE TABLE sessions (id INTEGER PRIMARY KEY, user_id INTEGER, created_at TIMESTAMP, expires_at TIMESTAMP, ip_address TEXT, user_agent TEXT)"
+                )
+            )
             conn.commit()
+            # Must strictly fail closed and return unrecognized!
             assert inspect_legacy_schema(conn) == "unrecognized"
+
+        # 4. Alembic-managed database -> alembic_managed
+        with engine.connect() as conn:
+            conn.execute(
+                text(
+                    "CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY)"
+                )
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO alembic_version VALUES ('0002_add_password_updated_at')"
+                )
+            )
+            conn.commit()
+            assert inspect_legacy_schema(conn) == "alembic_managed"
 
 
 def test_get_alembic_config_helper_percent_escaping():
@@ -328,3 +360,18 @@ def test_get_alembic_config_helper_percent_escaping():
     # get_main_option should return unescaped URL
     retrieved_url = config.get_main_option("sqlalchemy.url")
     assert retrieved_url == test_url
+
+
+def test_env_py_loads_database_url_from_env(monkeypatch: pytest.MonkeyPatch):
+    """Test env.py resolves FASTAPI_ACCOUNTS_DATABASE_URL environment variable when sqlalchemy.url is omitted."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = os.path.join(tmpdir, "env_test.db")
+        sync_db_url = f"sqlite:///{db_path}"
+
+        monkeypatch.setenv("FASTAPI_ACCOUNTS_DATABASE_URL", sync_db_url)
+
+        # Create config without sqlalchemy.url set
+        alembic_cfg = get_alembic_config()
+        # Upgrade to head using environment variable URL
+        command.upgrade(alembic_cfg, "head")
+        command.check(alembic_cfg)
