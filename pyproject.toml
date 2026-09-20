@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "fastapi-accounts"
-version = "0.1.0a4"
+version = "0.1.0a5"
 description = "Modern, zero-boilerplate authentication and account management for FastAPI."
 readme = "README.md"
 license = "Apache-2.0"
@@ -33,6 +33,7 @@ dependencies = [
     "pwdlib[argon2]>=0.2.0",
     "cryptography>=42.0.0",
     "uvicorn>=0.52.4",
+    "anyio>=4.0.0",
 ]
 
 [project.optional-dependencies]
@@ -66,7 +67,7 @@ pythonpath = ["src", "."]
 asyncio_mode = "auto"
 
 [tool.ruff.lint]
-ignore = ["B008"]
+ignore = ["B008", "BLE001"]
 
 [project.urls]
 Homepage = "https://github.com/fastapi-accounts/fastapi-accounts"

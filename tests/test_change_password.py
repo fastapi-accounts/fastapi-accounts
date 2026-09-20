@@ -3,6 +3,7 @@ from fastapi import Depends, FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from fastapi_accounts.core import FastAPIAccounts
+from fastapi_accounts.schemas.principal import UserPrincipal
 
 
 @pytest.mark.asyncio
@@ -11,8 +12,10 @@ async def test_change_password_success(cookie_accounts: FastAPIAccounts):
     app.include_router(cookie_accounts.router, prefix="/api/v1/auth")
 
     @app.get("/protected")
-    async def protected_endpoint(user=Depends(cookie_accounts.current_active_user)):
-        return {"email": user.primary_email}
+    async def protected_endpoint(
+        user: UserPrincipal = Depends(cookie_accounts.current_active_user),
+    ):
+        return {"email": user.email}
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -95,8 +98,10 @@ async def test_change_password_revoke_other_sessions(cookie_accounts: FastAPIAcc
     app.include_router(cookie_accounts.router, prefix="/api/v1/auth")
 
     @app.get("/protected")
-    async def protected_endpoint(user=Depends(cookie_accounts.current_active_user)):
-        return {"email": user.primary_email}
+    async def protected_endpoint(
+        user: UserPrincipal = Depends(cookie_accounts.current_active_user),
+    ):
+        return {"email": user.email}
 
     transport = ASGITransport(app=app)
     # Client A (Device 1)
@@ -149,8 +154,10 @@ async def test_change_password_preserve_other_sessions(
     app.include_router(cookie_accounts.router, prefix="/api/v1/auth")
 
     @app.get("/protected")
-    async def protected_endpoint(user=Depends(cookie_accounts.current_active_user)):
-        return {"email": user.primary_email}
+    async def protected_endpoint(
+        user: UserPrincipal = Depends(cookie_accounts.current_active_user),
+    ):
+        return {"email": user.email}
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client_a:

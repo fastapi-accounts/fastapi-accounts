@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String
+from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Integer, String
 from sqlalchemy.orm import Mapped, declared_attr, mapped_column
 
 
@@ -89,6 +89,18 @@ class PasswordCredentialMixin:
     @declared_attr
     def password_updated_at(cls) -> Mapped[datetime]:
         return mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+    @declared_attr
+    def credential_version(cls) -> Mapped[int]:
+        return mapped_column(
+            Integer,
+            CheckConstraint(
+                "credential_version >= 1",
+                name="ck_password_credentials_credential_version_positive",
+            ),
+            default=1,
+            nullable=False,
+        )
 
     @declared_attr
     def created_at(cls) -> Mapped[datetime]:

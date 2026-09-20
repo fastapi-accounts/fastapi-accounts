@@ -1,5 +1,6 @@
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import StaticPool
 
 from fastapi_accounts.adapters.sqlalchemy import SQLAlchemyAdapter
 from fastapi_accounts.core import FastAPIAccounts
@@ -12,6 +13,8 @@ from fastapi_accounts.transports.cookie import CookieTransport
 async def async_engine():
     engine = create_async_engine(
         "sqlite+aiosqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
         echo=False,
     )
     async with engine.begin() as conn:
@@ -37,7 +40,8 @@ def cookie_accounts(adapter):
     return FastAPIAccounts(
         adapter=adapter,
         secret_key="test-secret-key-at-least-32-characters-long-1234567890",
-        transport=CookieTransport(),
+        transport=CookieTransport(cookie_secure=False, csrf_protect=False),
+        allowed_origins=["http://testserver", "http://test", "http://localhost"],
         verify_email_required=False,
     )
 
@@ -48,5 +52,6 @@ def bearer_accounts(adapter):
         adapter=adapter,
         secret_key="test-secret-key-at-least-32-characters-long-1234567890",
         transport=BearerTransport(),
+        allowed_origins=["http://testserver", "http://test", "http://localhost"],
         verify_email_required=False,
     )

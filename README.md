@@ -22,7 +22,7 @@ Today, building authentication in FastAPI usually means either:
 2. **Wrestling with complex generic typing and multi-file wiring** in older libraries that are now in maintenance mode.
 3. **Paying steep monthly fees** to vendor-locked cloud auth providers (Clerk, Auth0).
 
-**FastAPI Accounts** aims to provide a zero-boilerplate authentication and account management engine built for **FastAPI**, **Pydantic v2**, and **Async SQLAlchemy 2.0**.
+**FastAPI Accounts** provides a modular, production-hardened authentication and account management engine built for **FastAPI**, **Pydantic v2**, and **Async SQLAlchemy 2.0**.
 
 📖 *Read our full story: [**The Journey of FastAPI Accounts (JOURNEY.md)**](JOURNEY.md).*
 
@@ -32,21 +32,25 @@ Today, building authentication in FastAPI usually means either:
 
 * **⚡ Minimal Setup:** Core authentication and account endpoints mounted with a single router and sensible defaults.
 * **🍪 Dual-Transport Architecture:**
-  * **Cookie Transport (Web & SPAs):** `HttpOnly` `SameSite=Lax` session cookies.
+  * **Cookie Transport (Web & SPAs):** `HttpOnly` `SameSite=Lax` session cookies with `Secure=True` by default.
   * **Bearer Transport (Mobile & CLI):** `Authorization: Bearer <token>` token transport.
 * **🛡️ Security-First Primitives:**
-  * **Argon2id** password hashing via `pwdlib`.
-  * **Single-Use Password Reset:** Fail-closed timed token verification with database atomic compare-and-swap (CAS) to prevent sequential and concurrent replay attacks.
-  * **Session Revocation:** Immediate invalidation of all existing sessions upon password reset.
-  * **Response DTO Whitelisting:** Strict serialization preventing accidental hash disclosure.
+  * **Async Offloaded Argon2id:** Hashing and verification run off the event loop via worker threads with configurable `CapacityLimiter`.
+  * **Timing Oracle Equalization:** Missing users execute dummy hash verification to prevent response-time enumeration.
+  * **Monotonic Credential Versioning:** Database check-constrained `credential_version >= 1` with atomic Compare-And-Swap (CAS) to guarantee single-use reset tokens even under frozen or skewed system clocks.
+  * **Session-Bound CSRF Protection:** Signed double-submit CSRF tokens and strict `Origin`/`Referer` validation against untrusted or sibling origins.
+  * **PII-Safe Rate Limiting:** Built-in sliding-window limiter with HMAC-hashed identity keys protecting sensitive authentication flows.
+  * **Session Revocation:** Invalidation of existing sessions upon password reset or change.
+  * **Response DTO Whitelisting:** Strict serialization returning immutable `UserPrincipal` DTOs.
   * **Sanitized Logging:** Zero raw security tokens or credential material in stdout/stderr/logs.
 * **🗄️ Database & Schema Management:**
   * Async SQLAlchemy 2.0 with type-annotated declarative mixins.
-  * Packaged Alembic migrations for default models with expand/backfill/constrain upgrade paths.
+  * Request-scoped session dependency injection honoring `app.dependency_overrides`.
+  * Packaged Alembic migrations for default models with deterministic upgrade and adoption paths.
 
 ---
 
-## 🚀 Quickstart (15 Lines of Code)
+## 🚀 Quickstart
 
 ### 1. Installation
 
@@ -67,10 +71,15 @@ uv add "fastapi-accounts[sqlite]" --prerelease=allow
 import os
 from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI
-from fastapi_accounts import FastAPIAccounts, SQLAlchemyAdapter
+from fastapi_accounts import (
+    CookieTransport,
+    FastAPIAccounts,
+    SQLAlchemyAdapter,
+    UserPrincipal,
+)
 
 # 1. Initialize adapter & account engine
-# In production, provide a cryptographically secure secret (minimum 32 characters):
+# In production, provide a secret key representing at least 256 bits of entropy:
 # $ export FASTAPI_ACCOUNTS_SECRET_KEY=$(openssl rand -hex 32)
 adapter = SQLAlchemyAdapter(database_url="sqlite+aiosqlite:///./accounts.db")
 accounts = FastAPIAccounts(
@@ -79,6 +88,8 @@ accounts = FastAPIAccounts(
         "FASTAPI_ACCOUNTS_SECRET_KEY",
         "dev-secret-key-must-be-at-least-32-chars-long-change-in-prod-1234567890",
     ),
+    # For local development without HTTPS, set cookie_secure=False:
+    transport=CookieTransport(cookie_secure=False),
 )
 
 
@@ -94,10 +105,10 @@ app = FastAPI(title="My API", lifespan=lifespan)
 app.include_router(accounts.router, prefix="/api/v1/auth", tags=["Auth"])
 
 
-# 3. Protect any endpoint with clean dependency injection
+# 3. Protect any endpoint with clean dependency injection returning UserPrincipal DTO
 @app.get("/api/v1/profile")
-async def get_profile(user=Depends(accounts.current_active_user)):
-    return {"message": f"Welcome back, {user.primary_email}!", "user_id": user.id}
+async def get_profile(user: UserPrincipal = Depends(accounts.current_active_user)):
+    return {"message": f"Welcome back, {user.email}!", "user_id": user.id}
 ```
 
 ---
@@ -145,67 +156,49 @@ If upgrading an existing database initialized with `v0.1.0a2` or `v0.1.0a3` usin
 2. **Inspect your schema** to verify compatibility:
    ```python
    from sqlalchemy import create_engine
-   from fastapi_accounts.migrations import inspect_legacy_schema
+   from fastapi_accounts.migrations import inspect_legacy_schema, SchemaState
 
    engine = create_engine("sqlite:///./accounts.db")
    with engine.connect() as conn:
-       version = inspect_legacy_schema(conn)
-       print(f"Detected schema version: {version}")
+       result = inspect_legacy_schema(conn)
+       print(f"Detected schema state: {result.state.value}")
    ```
 3. **Apply the appropriate migration path:**
-   * **If `alembic_managed`** (database is already tracked by Alembic):
+   * **If `ALEMBIC_MANAGED`** (database is already tracked by Alembic):
      ```bash
-     # Do NOT stamp; simply upgrade to head
      alembic upgrade head
      ```
-   * **If `v0.1.0a2`** (unmanaged baseline lacking `password_updated_at` column):
+   * **If `UNVERSIONED_CURRENT`** (unmanaged schema with `credential_version` and indexes):
+     ```bash
+     alembic stamp 0004_add_credential_version
+     alembic upgrade head
+     ```
+   * **If `UNVERSIONED_A3`** (unmanaged schema containing `password_updated_at` and indexes):
+     ```bash
+     alembic stamp 0003_add_session_indexes
+     alembic upgrade head
+     ```
+   * **If `UNVERSIONED_A2`** (unmanaged baseline lacking `password_updated_at` column):
      ```bash
      alembic stamp 0001_initial_schema
      alembic upgrade head
      ```
-   * **If `v0.1.0a3`** (unmanaged schema containing `password_updated_at` and indexes):
-     ```bash
-     alembic stamp head
-     ```
-   * **If `unrecognized`:** Do not stamp; inspect your database schema for custom modifications.
-
----
-
-## 🗺️ Roadmap & Milestones
-
-| Milestone | Target Capabilities | Status |
-| :--- | :--- | :---: |
-| **v0.1.0a4** | Argon2id hashing, Single-use password reset with CAS, Dual-transport (Cookies + Bearer), Async SQLAlchemy 2.0 & Alembic migrations (`fastapi_accounts:migrations`), Fail-safe database commit durability, Sanitized logging & DTO whitelisting | 🎯 **Hardened on `fix/phase1-hardening` (v0.1.0a4 candidate)** |
-| **v0.1.0a5 (Async Performance & DI)** | Offload Argon2id hashing (`anyio.to_thread`), Request-scoped DB session injection, Timing oracle equalization | 🎯 **Next Sprint** |
-| **v0.2.0a1 (Packaging & Typing)** | Complete type annotations, OpenAPI `securitySchemes` authorization in Swagger, Production secure cookie defaults | 📋 Planned |
-| **v0.3.0 (Multi-Email & DB Matrix)** | Secondary email lifecycle & promotion, PostgreSQL service container CI integration matrix | 📋 Planned |
-| **v0.4.0 (Social Accounts & MFA)** | Google OAuth2/OIDC integration, Safe social account linking, TOTP MFA | 📋 Planned |
-| **Future Horizons** | CSRF tokens & Origin binding, Refresh token rotation, Session device management, WebAuthn Passkeys | 💡 Under RFC |
-
+   * **If `UNKNOWN`:** Do not stamp; inspect your database schema for custom modifications or structural discrepancies.
 
 ---
 
 ## 🧪 Running Tests
 
-FastAPI Accounts comes with an automated test suite:
+FastAPI Accounts comes with a comprehensive automated test suite:
 
 ```bash
 # Clone the repository
 git clone https://github.com/fastapi-accounts/fastapi-accounts.git
 cd fastapi-accounts
 
-# Run tests with uv
-uv run --all-extras pytest
+# Run tests with pytest
+pytest -v
 ```
-
----
-
-## 💬 Join the Community & RFC
-
-We are actively designing the OAuth linking and Passkey architecture:
-* 💡 **Have feedback or ideas?** Join our [GitHub Discussions](https://github.com/fastapi-accounts/fastapi-accounts/discussions).
-* 🐛 **Found a bug or missing feature?** Open an [Issue](https://github.com/fastapi-accounts/fastapi-accounts/issues).
-* ⭐ **Support the project:** Star this repository on GitHub!
 
 ---
 

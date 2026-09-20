@@ -4,6 +4,7 @@ from httpx import ASGITransport, AsyncClient
 
 from fastapi_accounts.adapters.sqlalchemy import SQLAlchemyAdapter
 from fastapi_accounts.core import FastAPIAccounts
+from fastapi_accounts.schemas.principal import UserPrincipal
 from fastapi_accounts.transports.cookie import CookieTransport
 
 
@@ -13,8 +14,10 @@ async def test_password_reset_flow_e2e(cookie_accounts: FastAPIAccounts):
     app.include_router(cookie_accounts.router, prefix="/api/v1/auth")
 
     @app.get("/protected")
-    async def protected_endpoint(user=Depends(cookie_accounts.current_active_user)):
-        return {"email": user.primary_email}
+    async def protected_endpoint(
+        user: UserPrincipal = Depends(cookie_accounts.current_active_user),
+    ):
+        return {"email": user.email}
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -52,11 +55,14 @@ async def test_password_reset_flow_e2e(cookie_accounts: FastAPIAccounts):
                 session, "charlie@example.com"
             )
             assert user is not None
-            assert user.password_credential is not None
-            reset_token = cookie_accounts.generate_password_reset_token(
+            cred = await cookie_accounts.adapter.get_password_credential(
+                session, user.id
+            )
+            assert cred is not None
+            reset_token = cookie_accounts.service.generate_password_reset_token(
                 user.id,
                 "charlie@example.com",
-                pwd_ts=user.password_credential.password_updated_at,
+                cred.credential_version,
             )
 
         # 6. Complete password reset with new password
@@ -98,7 +104,6 @@ async def test_password_reset_anti_enumeration(cookie_accounts: FastAPIAccounts)
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        # Request password reset for a non-existent email
         resp = await client.post(
             "/api/v1/auth/request-password-reset",
             json={"email": "nonexistent@example.com"},
@@ -116,7 +121,6 @@ async def test_password_reset_tampered_and_expired_tokens(
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        # Register user
         await client.post(
             "/api/v1/auth/register",
             json={"email": "david@example.com", "password": "DavidPassword123!"},
@@ -127,10 +131,14 @@ async def test_password_reset_tampered_and_expired_tokens(
                 session, "david@example.com"
             )
             assert user is not None
+            cred = await cookie_accounts.adapter.get_password_credential(
+                session, user.id
+            )
+            assert cred is not None
 
         # 1. Tampered signature
-        valid_token = cookie_accounts.generate_password_reset_token(
-            user.id, "david@example.com"
+        valid_token = cookie_accounts.service.generate_password_reset_token(
+            user.id, "david@example.com", cred.credential_version
         )
         tampered_token = valid_token[:-4] + "abcd"
         bad_sig_resp = await client.post(
@@ -146,6 +154,8 @@ async def test_password_reset_tampered_and_expired_tokens(
                 "sub": str(user.id),
                 "email": "david@example.com",
                 "action": "reset_password",
+                "token_v": 2,
+                "cred_v": cred.credential_version,
             },
             max_age_seconds=-10,
         )
@@ -170,7 +180,7 @@ async def test_cross_action_token_isolation(cookie_accounts: FastAPIAccounts):
         )
 
         # 1. Try to use an email verification token to reset password
-        verify_token = cookie_accounts.generate_email_verification_token(
+        verify_token = cookie_accounts.service.generate_email_verification_token(
             "eve@example.com"
         )
         cross_resp1 = await client.post(
@@ -186,8 +196,12 @@ async def test_cross_action_token_isolation(cookie_accounts: FastAPIAccounts):
                 session, "eve@example.com"
             )
             assert user is not None
-        reset_token = cookie_accounts.generate_password_reset_token(
-            user.id, "eve@example.com"
+            cred = await cookie_accounts.adapter.get_password_credential(
+                session, user.id
+            )
+            assert cred is not None
+        reset_token = cookie_accounts.service.generate_password_reset_token(
+            user.id, "eve@example.com", cred.credential_version
         )
         cross_resp2 = await client.post(
             "/api/v1/auth/verify-email",
@@ -202,12 +216,13 @@ async def test_custom_password_reset_callback(adapter: SQLAlchemyAdapter):
     dispatched_tokens = []
 
     async def custom_callback(user, token):
-        dispatched_tokens.append((user.primary_email, token))
+        dispatched_tokens.append((user.email, token))
 
     accounts = FastAPIAccounts(
         adapter=adapter,
         secret_key="callback-test-secret-at-least-32-chars-long",
-        transport=CookieTransport(),
+        transport=CookieTransport(cookie_secure=False, csrf_protect=False),
+        allowed_origins=["http://testserver", "http://test"],
         on_after_request_password_reset=custom_callback,
     )
 
@@ -230,8 +245,7 @@ async def test_custom_password_reset_callback(adapter: SQLAlchemyAdapter):
         email, token = dispatched_tokens[0]
         assert email == "frank@example.com"
 
-        # Verify the dispatched token is valid
-        payload = accounts.verify_password_reset_token(token)
+        payload = accounts.token_signer.verify_token(token)
         assert payload is not None
         assert payload["email"] == "frank@example.com"
         assert payload["action"] == "reset_password"

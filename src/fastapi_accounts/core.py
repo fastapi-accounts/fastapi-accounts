@@ -1,9 +1,10 @@
-import inspect
+from __future__ import annotations
+
 import logging
 import os
 import uuid
-from collections.abc import Callable
-from datetime import datetime
+from collections.abc import Callable, Sequence
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
@@ -11,7 +12,7 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from fastapi_accounts.adapters.sqlalchemy import SQLAlchemyAdapter
-from fastapi_accounts.models.default import User
+from fastapi_accounts.dependencies.auth import create_current_user_dependency
 from fastapi_accounts.schemas.auth import (
     ChangePasswordRequest,
     EmailVerificationRequest,
@@ -22,8 +23,27 @@ from fastapi_accounts.schemas.auth import (
     ResetPasswordRequest,
     TokenResponse,
 )
-from fastapi_accounts.schemas.user import UserRead
-from fastapi_accounts.security.tokens import TimedTokenSigner, generate_secure_token
+from fastapi_accounts.schemas.principal import UserPrincipal
+from fastapi_accounts.schemas.user import EmailAddressRead, UserRead
+from fastapi_accounts.security.csrf import (
+    create_pre_auth_csrf_token,
+    create_session_csrf_token,
+    validate_csrf_token,
+    validate_origin_header,
+)
+from fastapi_accounts.security.password import PasswordService
+from fastapi_accounts.security.rate_limiter import (
+    BaseRateLimiter,
+    InMemorySlidingWindowLimiter,
+    build_rate_limit_key,
+    resolve_client_ip,
+)
+from fastapi_accounts.security.tokens import (
+    TimedTokenSigner,
+    derive_key,
+    hash_token,
+)
+from fastapi_accounts.services.account import AccountService
 from fastapi_accounts.transports.base import BaseTransport
 from fastapi_accounts.transports.bearer import BearerTransport
 from fastapi_accounts.transports.cookie import CookieTransport
@@ -31,11 +51,8 @@ from fastapi_accounts.transports.cookie import CookieTransport
 logger = logging.getLogger("fastapi_accounts")
 
 
-def _get_pwd_state_ts(dt: datetime | None) -> int:
-    """Return microsecond epoch integer for password state tracking."""
-    if dt is None:
-        return 0
-    return int(dt.timestamp() * 1_000_000)
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 class FastAPIAccounts:
@@ -44,128 +61,166 @@ class FastAPIAccounts:
     def __init__(
         self,
         adapter: SQLAlchemyAdapter,
-        secret_key: str,
+        secret_key: str | Sequence[str],
         transport: BaseTransport | None = None,
         verify_email_required: bool = False,
         session_max_age_seconds: int = 86400 * 14,
         reset_password_token_max_age_seconds: int = 900,
+        argon2_concurrency: int = 4,
+        rate_limiter: BaseRateLimiter | None = None,
+        allowed_origins: list[str] | None = None,
+        trusted_proxies: list[str] | None = None,
         debug: bool = False,
-        on_after_register: Callable[[User, str], Any] | None = None,
-        on_after_request_password_reset: Callable[[User, str], Any] | None = None,
+        on_after_register: Callable[..., Any] | None = None,
+        on_after_request_password_reset: Callable[..., Any] | None = None,
+        on_delivery_failure: Callable[..., Any] | None = None,
     ):
         self.adapter = adapter
 
-        # Resolve secret key from environment if prefixed with env:
-        if secret_key.startswith("env:"):
-            env_var = secret_key.split("env:", 1)[1]
-            resolved_key = os.environ.get(env_var, "")
-            if not resolved_key:
-                raise ValueError(f"Environment variable '{env_var}' is not set.")
-            self.secret_key = resolved_key
+        # Resolve secret key sequence
+        raw_keys: list[str]
+        if isinstance(secret_key, str):
+            raw_keys = [secret_key]
         else:
-            self.secret_key = secret_key
+            raw_keys = list(secret_key)
 
-        if not self.secret_key or len(self.secret_key) < 32:
-            raise ValueError(
-                "FastAPIAccounts secret_key must be a non-empty string of at least 32 characters. "
-                "Generate a high-entropy secure key using `secrets.token_urlsafe(32)` or `openssl rand -hex 32`."
-            )
+        resolved_keys: list[str] = []
+        for k in raw_keys:
+            if k.startswith("env:"):
+                env_var = k.split("env:", 1)[1]
+                val = os.environ.get(env_var, "")
+                if not val:
+                    raise ValueError(f"Environment variable '{env_var}' is not set.")
+                resolved_keys.append(val)
+            else:
+                resolved_keys.append(k)
 
+        self.secret_keys = resolved_keys
         self.transport = transport or CookieTransport()
         self.verify_email_required = verify_email_required
         self.session_max_age_seconds = session_max_age_seconds
         self.reset_password_token_max_age_seconds = reset_password_token_max_age_seconds
+        self.argon2_concurrency = argon2_concurrency
+        self.allowed_origins = allowed_origins
+        self.trusted_proxies = trusted_proxies
         self.debug = debug
-        self.on_after_register = on_after_register
-        self.on_after_request_password_reset = on_after_request_password_reset
 
-        self.token_signer = TimedTokenSigner(self.secret_key)
+        # Rate limiter setup
+        self.rate_limiter = rate_limiter or InMemorySlidingWindowLimiter()
+        self.login_rate_limit = (5, 60)
+        self.register_rate_limit = (10, 3600)
+        self.request_reset_rate_limit = (3, 300)
+        self.reset_password_rate_limit = (5, 300)
+        self.request_verify_rate_limit = (3, 300)
+        self.verify_email_rate_limit = (10, 300)
+        self.change_password_rate_limit = (5, 300)
+
+        # Cryptographic signers & services
+        self.token_signer = TimedTokenSigner(
+            self.secret_keys, domain=b"fastapi-accounts-auth-token"
+        )
+        self.csrf_signing_key = derive_key(
+            self.secret_keys[0], b"fastapi-accounts-csrf-token"
+        )
+        self.ratelimit_hmac_key = derive_key(
+            self.secret_keys[0], b"fastapi-accounts-ratelimit-hash"
+        )
+
+        self.password_service = PasswordService(
+            argon2_concurrency=self.argon2_concurrency
+        )
+
+        # Domain service layer
+        self.service = AccountService(
+            store=self.adapter,
+            password_service=self.password_service,
+            token_signer=self.token_signer,
+            on_after_register=on_after_register,
+            on_after_request_password_reset=on_after_request_password_reset,
+            on_delivery_failure=on_delivery_failure,
+            reset_password_token_max_age_seconds=self.reset_password_token_max_age_seconds,
+        )
+
+        # Request-scoped dependencies
+        self.get_current_user = create_current_user_dependency(
+            adapter=self.adapter,
+            service=self.service,
+            transport=self.transport,
+            optional=True,
+        )
+        self.current_active_user = create_current_user_dependency(
+            adapter=self.adapter,
+            service=self.service,
+            transport=self.transport,
+            optional=False,
+            superuser_required=False,
+        )
+        self.current_superuser = create_current_user_dependency(
+            adapter=self.adapter,
+            service=self.service,
+            transport=self.transport,
+            optional=False,
+            superuser_required=True,
+        )
+
         self.router = self._build_router()
 
-    def generate_email_verification_token(self, email: str) -> str:
-        """Generate a cryptographically signed verification token for an email address."""
-        return self.token_signer.create_token(
-            {"email": email.strip().lower(), "action": "verify_email"}
-        )
-
-    def verify_email_verification_token(self, token: str) -> str | None:
-        """Validate an email verification token and return the email if valid."""
-        payload = self.token_signer.verify_token(token)
-        if payload and payload.get("action") == "verify_email":
-            return payload.get("email")
-        return None
-
-    def generate_password_reset_token(
+    async def _enforce_rate_limit(
         self,
-        user_id: uuid.UUID,
-        email: str,
-        pwd_ts: int | datetime | None = None,
-    ) -> str:
-        """Generate a cryptographically signed password reset token bound to current password state."""
-        if isinstance(pwd_ts, datetime):
-            ts_val = _get_pwd_state_ts(pwd_ts)
-        elif isinstance(pwd_ts, int):
-            ts_val = pwd_ts
-        else:
-            ts_val = 0
-
-        return self.token_signer.create_token(
-            {
-                "sub": str(user_id),
-                "email": email.strip().lower(),
-                "action": "reset_password",
-                "pwd_ts": ts_val,
-            },
-            max_age_seconds=self.reset_password_token_max_age_seconds,
+        action: str,
+        identity: str | None,
+        request: Request,
+        max_reqs: int,
+        window_sec: int,
+    ) -> None:
+        client_ip = resolve_client_ip(request, self.trusted_proxies)
+        key = build_rate_limit_key(action, identity, client_ip, self.ratelimit_hmac_key)
+        allowed, retry_after = await self.rate_limiter.check_rate_limit(
+            key, max_reqs, window_sec
         )
+        if not allowed:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Too many requests. Please try again later.",
+                headers={"Retry-After": str(retry_after)},
+            )
 
-    def verify_password_reset_token(self, token: str) -> dict[str, Any] | None:
-        """Validate a password reset token and return the payload if valid."""
-        payload = self.token_signer.verify_token(token)
-        if payload and payload.get("action") == "reset_password" and "sub" in payload:
-            return payload
-        return None
-
-    async def _dispatch_verification_email(
-        self, user: User, email: str, token: str
+    def _enforce_csrf(
+        self, request: Request, current_session_id: str | None = None
     ) -> None:
-        """Trigger developer-supplied callback or log event in development/production."""
-        if self.on_after_register:
-            if inspect.iscoroutinefunction(self.on_after_register):
-                await self.on_after_register(user, token)
-            else:
-                self.on_after_register(user, token)
-        else:
-            if self.debug:
-                logger.debug(
-                    f"📨 [FastAPI Accounts] Verification token generated for '{email}' (prefix: {token[:8]}...)"
+        if isinstance(self.transport, CookieTransport) and getattr(
+            self.transport, "csrf_protect", True
+        ):
+            if not validate_origin_header(request, self.allowed_origins):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Cross-origin request rejected.",
                 )
-            else:
-                logger.info(
-                    f"📨 [FastAPI Accounts] Verification email requested for '{email}'."
-                )
-
-    async def _dispatch_password_reset_email(
-        self, user: User, email: str, token: str
-    ) -> None:
-        """Trigger developer-supplied callback or log event."""
-        if self.on_after_request_password_reset:
-            if inspect.iscoroutinefunction(self.on_after_request_password_reset):
-                await self.on_after_request_password_reset(user, token)
-            else:
-                self.on_after_request_password_reset(user, token)
-        else:
-            if self.debug:
-                logger.debug(
-                    f"🔑 [FastAPI Accounts] Password reset token generated for '{email}' (prefix: {token[:8]}...)"
-                )
-            else:
-                logger.info(
-                    f"🔑 [FastAPI Accounts] Password reset requested for '{email}'."
+            cookie_token = request.cookies.get(self.transport.csrf_cookie_name)
+            header_token = request.headers.get("x-csrf-token") or request.headers.get(
+                "x-xsrf-token"
+            )
+            if not validate_csrf_token(
+                cookie_token, header_token, current_session_id, self.csrf_signing_key
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="CSRF token missing or invalid.",
                 )
 
     def _build_router(self) -> APIRouter:
         router = APIRouter()
+
+        @router.get(
+            "/csrf",
+            summary="Bootstrap pre-authentication CSRF token",
+        )
+        async def get_csrf_token(response: Response) -> dict[str, str]:
+            response.headers["Cache-Control"] = "no-store, private"
+            csrf_token = create_pre_auth_csrf_token(self.csrf_signing_key)
+            if isinstance(self.transport, CookieTransport):
+                self.transport.set_csrf_cookie(response, csrf_token)
+            return {"csrf_token": csrf_token}
 
         @router.post(
             "/register",
@@ -175,45 +230,56 @@ class FastAPIAccounts:
         )
         async def register(
             payload: RegisterRequest,
+            request: Request,
             response: Response,
             db: AsyncSession = Depends(self.adapter.get_db),
         ):
+            await self._enforce_rate_limit(
+                "register", payload.email, request, *self.register_rate_limit
+            )
+            self._enforce_csrf(request)
+
             try:
-                user, email_record = await self.adapter.create_user_with_password(
+                principal, _ = await self.service.register_user(
                     session=db,
                     email=payload.email,
                     password=payload.password,
                     is_verified=False,
                 )
-                await db.commit()
-                await db.refresh(user)
             except ValueError as e:
-                await db.rollback()
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)
                 )
             except IntegrityError:
-                await db.rollback()
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="User with this email already exists.",
                 )
             except SQLAlchemyError as e:
-                await db.rollback()
                 logger.error("Database error during registration: %s", type(e).__name__)
                 raise HTTPException(
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                     detail="Database error during registration.",
                 )
 
-            verification_token = self.generate_email_verification_token(
-                email_record.email
+            emails_list = [
+                EmailAddressRead(
+                    id=uuid.uuid4(),
+                    user_id=principal.id,
+                    email=principal.email or payload.email,
+                    is_verified=principal.is_verified,
+                    is_primary=True,
+                    created_at=principal.created_at or _now(),
+                )
+            ]
+            return UserRead(
+                id=principal.id,
+                is_active=principal.is_active,
+                is_superuser=principal.is_superuser,
+                created_at=principal.created_at or _now(),
+                updated_at=principal.updated_at or _now(),
+                emails=emails_list,
             )
-            await self._dispatch_verification_email(
-                user, email_record.email, verification_token
-            )
-
-            return UserRead.model_validate(user)
 
         @router.post(
             "/verify-email",
@@ -221,27 +287,24 @@ class FastAPIAccounts:
         )
         async def verify_email(
             payload: EmailVerificationRequest,
+            request: Request,
             db: AsyncSession = Depends(self.adapter.get_db),
         ):
-            email = self.verify_email_verification_token(payload.token)
-            if not email:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Invalid or expired verification token.",
-                )
+            await self._enforce_rate_limit(
+                "verify_email", None, request, *self.verify_email_rate_limit
+            )
+            self._enforce_csrf(request)
 
             try:
-                email_record = await self.adapter.verify_email(db, email)
-                if not email_record:
+                principal = await self.service.verify_email(db, payload.token)
+                if not principal:
                     raise HTTPException(
-                        status_code=status.HTTP_404_NOT_FOUND,
-                        detail="Email address not found.",
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Invalid or expired verification token.",
                     )
-                await db.commit()
             except HTTPException:
                 raise
             except SQLAlchemyError as e:
-                await db.rollback()
                 logger.error(
                     "Database error during email verification: %s", type(e).__name__
                 )
@@ -258,24 +321,34 @@ class FastAPIAccounts:
         )
         async def request_verify_email(
             payload: RequestVerificationEmailRequest,
+            request: Request,
             db: AsyncSession = Depends(self.adapter.get_db),
         ):
+            await self._enforce_rate_limit(
+                "request_verify_email",
+                payload.email,
+                request,
+                *self.request_verify_rate_limit,
+            )
+            # Anti-enumeration: look up user and dispatch if eligible
             user = await self.adapter.get_user_by_email(db, payload.email)
             if user:
-                for email_record in user.emails:
+                for email_rec in user.emails:
                     if (
-                        email_record.email == payload.email.strip().lower()
-                        and not email_record.is_verified
+                        email_rec.email == payload.email.strip().lower()
+                        and not email_rec.is_verified
                     ):
-                        token = self.generate_email_verification_token(
-                            email_record.email
+                        token = self.service.generate_email_verification_token(
+                            email_rec.email
                         )
-                        await self._dispatch_verification_email(
-                            user, email_record.email, token
+                        await self.service._invoke_callback_safely(
+                            self.service.on_after_register,
+                            "request_verify_email",
+                            _to_principal_quick(user, email_rec.email),
+                            token,
                         )
                         break
 
-            # Always return a generic success message to prevent email enumeration
             return {
                 "message": "If the email is registered and unverified, a verification link has been sent."
             }
@@ -286,27 +359,16 @@ class FastAPIAccounts:
         )
         async def request_password_reset(
             payload: RequestPasswordResetRequest,
+            request: Request,
             db: AsyncSession = Depends(self.adapter.get_db),
         ):
-            user = await self.adapter.get_user_by_email(db, payload.email)
-            if user and user.is_active:
-                cred = await self.adapter.get_password_credential(db, user.id)
-                user_cred = getattr(user, "password_credential", None)
-                if cred is not None and cred.password_updated_at is not None:
-                    pwd_ts = _get_pwd_state_ts(cred.password_updated_at)
-                elif (
-                    user_cred is not None
-                    and getattr(user_cred, "password_updated_at", None) is not None
-                ):
-                    pwd_ts = _get_pwd_state_ts(user_cred.password_updated_at)
-                else:
-                    pwd_ts = 0
-                token = self.generate_password_reset_token(
-                    user.id, payload.email, pwd_ts=pwd_ts
-                )
-                await self._dispatch_password_reset_email(user, payload.email, token)
-
-            # Always return a generic success message to prevent email enumeration
+            await self._enforce_rate_limit(
+                "request_password_reset",
+                payload.email,
+                request,
+                *self.request_reset_rate_limit,
+            )
+            await self.service.request_password_reset(db, payload.email)
             return {
                 "message": "If an account with that email exists, a password reset link has been sent."
             }
@@ -317,52 +379,26 @@ class FastAPIAccounts:
         )
         async def reset_password(
             payload: ResetPasswordRequest,
+            request: Request,
             db: AsyncSession = Depends(self.adapter.get_db),
         ):
-            token_data = self.verify_password_reset_token(payload.token)
-            if not token_data:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Invalid or expired password reset token.",
-                )
+            await self._enforce_rate_limit(
+                "reset_password", None, request, *self.reset_password_rate_limit
+            )
+            self._enforce_csrf(request)
 
             try:
-                user_id = uuid.UUID(token_data["sub"])
-            except (ValueError, KeyError):
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Invalid token payload.",
-                )
-
-            token_pwd_ts = token_data.get("pwd_ts")
-            # Fail closed: must contain valid positive integer timestamp matching current credential
-            if (
-                token_pwd_ts is None
-                or not isinstance(token_pwd_ts, int)
-                or token_pwd_ts <= 0
-            ):
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Invalid or expired password reset token.",
-                )
-
-            try:
-                success = await self.adapter.atomic_reset_password(
-                    session=db,
-                    user_id=user_id,
-                    expected_pwd_ts=token_pwd_ts,
-                    new_password=payload.new_password,
+                success = await self.service.reset_password(
+                    db, payload.token, payload.new_password
                 )
                 if not success:
                     raise HTTPException(
                         status_code=status.HTTP_400_BAD_REQUEST,
                         detail="Invalid or expired password reset token.",
                     )
-                await db.commit()
             except HTTPException:
                 raise
             except SQLAlchemyError as e:
-                await db.rollback()
                 logger.error(
                     "Database error during password reset: %s", type(e).__name__
                 )
@@ -384,41 +420,38 @@ class FastAPIAccounts:
             response: Response,
             db: AsyncSession = Depends(self.adapter.get_db),
         ):
-            user = await self.adapter.authenticate_user(
+            await self._enforce_rate_limit(
+                "login", payload.email, request, *self.login_rate_limit
+            )
+            self._enforce_csrf(request)
+
+            principal, email_str = await self.service.authenticate_user(
                 session=db, email=payload.email, password=payload.password
             )
-            if not user:
+            if not principal:
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED,
                     detail="Invalid email or password.",
                 )
 
-            if self.verify_email_required:
-                # Check if user has at least one verified email
-                has_verified = any(e.is_verified for e in user.emails)
-                if not has_verified:
-                    raise HTTPException(
-                        status_code=status.HTTP_403_FORBIDDEN,
-                        detail="Email verification is required before logging in.",
-                    )
+            if self.verify_email_required and not principal.is_verified:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Email verification is required before logging in.",
+                )
 
-            # Issue new session
-            raw_session_token = generate_secure_token(32)
             client_ip = request.client.host if request.client else None
             user_agent = request.headers.get("user-agent")
 
             try:
-                await self.adapter.create_session(
+                raw_session_token, session_id = await self.service.create_session(
                     session=db,
-                    user_id=user.id,
-                    raw_token=raw_session_token,
+                    user_id=principal.id,
                     max_age_seconds=self.session_max_age_seconds,
                     ip_address=client_ip,
                     user_agent=user_agent,
                 )
-                await db.commit()
             except SQLAlchemyError as e:
-                await db.rollback()
                 logger.error(
                     "Database error during session creation: %s", type(e).__name__
                 )
@@ -427,15 +460,38 @@ class FastAPIAccounts:
                     detail="Database error during authentication.",
                 )
 
-            # Set response headers or cookies based on transport
             self.transport.set_login_response(response, raw_session_token)
+
+            if isinstance(self.transport, CookieTransport):
+                # Issue authenticated session-bound CSRF token
+                auth_csrf_token = create_session_csrf_token(
+                    session_id, self.csrf_signing_key
+                )
+                self.transport.set_csrf_cookie(response, auth_csrf_token)
 
             if isinstance(self.transport, BearerTransport):
                 return TokenResponse(
                     access_token=raw_session_token, token_type="bearer"
                 )
 
-            return UserRead.model_validate(user)
+            emails_list = [
+                EmailAddressRead(
+                    id=uuid.uuid4(),
+                    user_id=principal.id,
+                    email=principal.email or email_str or payload.email,
+                    is_verified=principal.is_verified,
+                    is_primary=True,
+                    created_at=principal.created_at or _now(),
+                )
+            ]
+            return UserRead(
+                id=principal.id,
+                is_active=principal.is_active,
+                is_superuser=principal.is_superuser,
+                created_at=principal.created_at or _now(),
+                updated_at=principal.updated_at or _now(),
+                emails=emails_list,
+            )
 
         @router.post(
             "/logout",
@@ -447,12 +503,14 @@ class FastAPIAccounts:
             db: AsyncSession = Depends(self.adapter.get_db),
         ):
             raw_token = self.transport.extract_token(request)
+            if isinstance(self.transport, CookieTransport):
+                current_sid = hash_token(raw_token) if raw_token else None
+                self._enforce_csrf(request, current_session_id=current_sid)
+
             if raw_token:
                 try:
-                    await self.adapter.revoke_session(db, raw_token)
-                    await db.commit()
+                    await self.service.revoke_session(db, raw_token)
                 except SQLAlchemyError as e:
-                    await db.rollback()
                     logger.error("Database error during logout: %s", type(e).__name__)
                     raise HTTPException(
                         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -469,32 +527,37 @@ class FastAPIAccounts:
         async def change_password(
             payload: ChangePasswordRequest,
             request: Request,
-            user: User = Depends(self.current_active_user),
+            user: UserPrincipal = Depends(self.current_active_user),
             db: AsyncSession = Depends(self.adapter.get_db),
         ):
+            await self._enforce_rate_limit(
+                "change_password",
+                str(user.id),
+                request,
+                *self.change_password_rate_limit,
+            )
+            raw_token = self.transport.extract_token(request)
+            if isinstance(self.transport, CookieTransport):
+                current_sid = hash_token(raw_token) if raw_token else None
+                self._enforce_csrf(request, current_session_id=current_sid)
+
             try:
-                success = await self.adapter.verify_and_update_password(
+                success = await self.service.change_password(
                     session=db,
                     user_id=user.id,
                     current_password=payload.current_password,
                     new_password=payload.new_password,
+                    current_raw_token=raw_token,
+                    revoke_other_sessions=payload.revoke_other_sessions,
                 )
                 if not success:
                     raise HTTPException(
                         status_code=status.HTTP_400_BAD_REQUEST,
                         detail="Current password is incorrect.",
                     )
-                if payload.revoke_other_sessions:
-                    raw_token = self.transport.extract_token(request)
-                    if raw_token:
-                        await self.adapter.revoke_other_user_sessions(
-                            db, user.id, raw_token
-                        )
-                await db.commit()
             except HTTPException:
                 raise
             except SQLAlchemyError as e:
-                await db.rollback()
                 logger.error(
                     "Database error during password change: %s", type(e).__name__
                 )
@@ -502,6 +565,7 @@ class FastAPIAccounts:
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                     detail="Database error during password change.",
                 )
+
             return {"message": "Password changed successfully."}
 
         @router.get(
@@ -509,56 +573,38 @@ class FastAPIAccounts:
             response_model=UserRead,
             summary="Retrieve current authenticated user profile",
         )
-        async def get_me(user: User = Depends(self.current_active_user)):
-            return user
+        async def get_me(user: UserPrincipal = Depends(self.current_active_user)):
+            emails_list = []
+            if user.email:
+                emails_list.append(
+                    EmailAddressRead(
+                        id=uuid.uuid4(),
+                        user_id=user.id,
+                        email=user.email,
+                        is_verified=user.is_verified,
+                        is_primary=True,
+                        created_at=user.created_at or _now(),
+                    )
+                )
+            return UserRead(
+                id=user.id,
+                is_active=user.is_active,
+                is_superuser=user.is_superuser,
+                created_at=user.created_at or _now(),
+                updated_at=user.updated_at or _now(),
+                emails=emails_list,
+            )
 
         return router
 
-    async def get_current_user(
-        self,
-        request: Request,
-        db: AsyncSession = Depends(lambda: None),
-    ) -> User | None:
-        """Dependency that returns the current authenticated User, or None if unauthenticated."""
-        # When called through FastAPI Depends(), retrieve session from adapter
-        raw_token = self.transport.extract_token(request)
-        if not raw_token:
-            return None
 
-        # Fetch db session from generator if not injected directly
-        async with self.adapter.session_maker() as db_session:
-            session_and_user = await self.adapter.get_session_and_user(
-                db_session, raw_token
-            )
-            if not session_and_user:
-                return None
-            return session_and_user[1]
-
-    async def current_active_user(
-        self,
-        request: Request,
-    ) -> User:
-        """Dependency that returns the authenticated active user, or raises 401 Unauthorized."""
-        user = await self.get_current_user(request)
-        if not user or not user.is_active:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Authentication credentials are required or invalid.",
-                headers={"WWW-Authenticate": "Bearer"}
-                if isinstance(self.transport, BearerTransport)
-                else None,
-            )
-        return user
-
-    async def current_superuser(
-        self,
-        request: Request,
-    ) -> User:
-        """Dependency that returns the authenticated superuser, or raises 403 Forbidden."""
-        user = await self.current_active_user(request)
-        if not user.is_superuser:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Superuser privileges are required.",
-            )
-        return user
+def _to_principal_quick(user: Any, email: str) -> UserPrincipal:
+    return UserPrincipal(
+        id=user.id,
+        email=email,
+        is_active=user.is_active,
+        is_superuser=user.is_superuser,
+        is_verified=False,
+        created_at=user.created_at,
+        updated_at=user.updated_at,
+    )

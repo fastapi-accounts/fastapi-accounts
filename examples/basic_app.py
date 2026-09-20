@@ -3,10 +3,16 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI
 
-from fastapi_accounts import FastAPIAccounts, SQLAlchemyAdapter
+from fastapi_accounts import (
+    CookieTransport,
+    FastAPIAccounts,
+    SQLAlchemyAdapter,
+    UserPrincipal,
+)
 
 # 1. Initialize the adapter and account engine
-# In production, pass secret_key via environment variable: export FASTAPI_ACCOUNTS_SECRET_KEY=$(openssl rand -hex 32)
+# In production, set cookie_secure=True (default) and pass secret_key via environment variable:
+# export FASTAPI_ACCOUNTS_SECRET_KEY=$(openssl rand -hex 32)
 adapter = SQLAlchemyAdapter(database_url="sqlite+aiosqlite:///./example_accounts.db")
 accounts = FastAPIAccounts(
     adapter=adapter,
@@ -14,6 +20,8 @@ accounts = FastAPIAccounts(
         "FASTAPI_ACCOUNTS_SECRET_KEY",
         "dev-secret-key-must-be-at-least-32-chars-long-change-in-prod-1234567890",
     ),
+    # Note: cookie_secure=False is used here for plain HTTP local testing. In production, leave cookie_secure=True (default).
+    transport=CookieTransport(cookie_secure=False),
 )
 
 
@@ -31,11 +39,11 @@ app.include_router(
 )
 
 
-# 3. Protect any endpoint with clean dependency injection
+# 3. Protect any endpoint with clean dependency injection returning UserPrincipal DTO
 @app.get("/api/v1/profile")
-async def get_profile(user=Depends(accounts.current_active_user)):
+async def get_profile(user: UserPrincipal = Depends(accounts.current_active_user)):
     return {
-        "message": f"Welcome back, {user.primary_email}!",
+        "message": f"Welcome back, {user.email}!",
         "user_id": user.id,
         "is_superuser": user.is_superuser,
     }

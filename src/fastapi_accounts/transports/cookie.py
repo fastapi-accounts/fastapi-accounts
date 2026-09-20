@@ -11,20 +11,24 @@ class CookieTransport(BaseTransport):
     def __init__(
         self,
         cookie_name: str = "fastapi_accounts_session",
+        csrf_cookie_name: str = "fastapi_accounts_csrf",
         max_age: int = 86400 * 14,  # 14 days
         path: str = "/",
         domain: str | None = None,
-        secure: bool = False,
+        cookie_secure: bool = True,
         httponly: bool = True,
         samesite: Literal["lax", "strict", "none"] = "lax",
+        csrf_protect: bool = True,
     ):
         self.cookie_name = cookie_name
+        self.csrf_cookie_name = csrf_cookie_name
         self.max_age = max_age
         self.path = path
         self.domain = domain
-        self.secure = secure
+        self.cookie_secure = cookie_secure
         self.httponly = httponly
         self.samesite = samesite
+        self.csrf_protect = csrf_protect
 
     def extract_token(self, request: Request) -> str | None:
         return request.cookies.get(self.cookie_name)
@@ -36,9 +40,32 @@ class CookieTransport(BaseTransport):
             max_age=self.max_age,
             path=self.path,
             domain=self.domain,
-            secure=self.secure,
+            secure=self.cookie_secure,
             httponly=self.httponly,
             samesite=self.samesite,
+        )
+
+    def set_csrf_cookie(
+        self, response: Response, csrf_token: str, max_age: int = 86400 * 14
+    ) -> None:
+        """Set double-submit CSRF cookie accessible by browser scripts."""
+        response.set_cookie(
+            key=self.csrf_cookie_name,
+            value=csrf_token,
+            max_age=max_age,
+            path=self.path,
+            domain=self.domain,
+            secure=self.cookie_secure,
+            httponly=False,
+            samesite=self.samesite,
+        )
+
+    def clear_csrf_cookie(self, response: Response) -> None:
+        """Clear CSRF cookie upon logout."""
+        response.delete_cookie(
+            key=self.csrf_cookie_name,
+            path=self.path,
+            domain=self.domain,
         )
 
     def set_logout_response(self, response: Response) -> None:
@@ -47,3 +74,4 @@ class CookieTransport(BaseTransport):
             path=self.path,
             domain=self.domain,
         )
+        self.clear_csrf_cookie(response)

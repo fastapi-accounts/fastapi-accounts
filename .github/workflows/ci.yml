@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "fix/*", "feat/*"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: test_user
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_DB: test_fastapi_accounts
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,postgres,sqlite,migrations]"
+
+      - name: Run Ruff Lint & Format Checks
+        run: |
+          ruff check .
+          ruff format --check .
+
+      - name: Run Mypy Type Checking
+        run: |
+          mypy src tests
+
+      - name: Run Test Suite (SQLite & PostgreSQL Integration)
+        env:
+          TEST_POSTGRES_URL: "postgresql+asyncpg://test_user:test_password@localhost:5432/test_fastapi_accounts"
+        run: |
+          pytest -v
+
+      - name: Build Wheel and Source Distribution
+        run: |
+          python -m build --no-build-isolation
+          twine check dist/*
+
+      - name: Isolated Wheel Smoke Test
+        run: |
+          python -m venv test_venv
+          ./test_venv/bin/pip install --upgrade pip
+          ./test_venv/bin/pip install dist/*.whl
+          ./test_venv/bin/python -c "import fastapi_accounts; print('Core import OK:', fastapi_accounts.__version__)"
+          ./test_venv/bin/pip install dist/*.whl[sqlite,migrations]
+          ./test_venv/bin/python -c "import fastapi_accounts.migrations; print('Migrations OK')"

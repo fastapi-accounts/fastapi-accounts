@@ -10,6 +10,8 @@ if TYPE_CHECKING:
     from sqlalchemy.engine import Connection
     from sqlalchemy.ext.asyncio import AsyncConnection
 
+    from fastapi_accounts.migrations.legacy import SchemaInspectionResult
+
 
 def get_migrations_directory() -> str:
     """Return the absolute filesystem path to the packaged Alembic migrations directory."""
@@ -35,14 +37,16 @@ def get_alembic_config(database_url: str | None = None) -> Config:
     return config
 
 
-def inspect_legacy_schema(connection: Connection) -> str:
+def inspect_legacy_schema(connection: Connection) -> SchemaInspectionResult:
     """Inspect an existing database schema and classify it."""
     from fastapi_accounts.migrations.legacy import inspect_legacy_schema as _inspect
 
     return _inspect(connection)
 
 
-async def async_inspect_legacy_schema(connection: AsyncConnection) -> str:
+async def async_inspect_legacy_schema(
+    connection: AsyncConnection,
+) -> SchemaInspectionResult:
     """Async wrapper for legacy schema inspection."""
     from fastapi_accounts.migrations.legacy import (
         async_inspect_legacy_schema as _async_inspect,

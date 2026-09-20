@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import uuid
 from collections.abc import AsyncGenerator
 from datetime import datetime, timedelta, timezone
@@ -17,7 +19,6 @@ from fastapi_accounts.models.default import (
     Session,
     User,
 )
-from fastapi_accounts.security.password import hash_password, verify_password
 from fastapi_accounts.security.tokens import hash_token
 
 
@@ -26,7 +27,7 @@ def utc_now() -> datetime:
 
 
 class SQLAlchemyAdapter:
-    """Async SQLAlchemy database adapter for FastAPI Accounts."""
+    """Async SQLAlchemy persistence store adapter for FastAPI Accounts."""
 
     def __init__(
         self,
@@ -99,7 +100,7 @@ class SQLAlchemyAdapter:
     async def get_password_credential(
         self, session: AsyncSession, user_id: uuid.UUID
     ) -> PasswordCredential | None:
-        """Retrieve password credential for a given user ID."""
+        """Retrieve password credential record for a user ID."""
         stmt = select(self.credential_model).where(
             self.credential_model.user_id == user_id
         )
@@ -110,14 +111,13 @@ class SQLAlchemyAdapter:
         self,
         session: AsyncSession,
         email: str,
-        password: str,
+        hashed_password: str,
         is_verified: bool = False,
         is_superuser: bool = False,
     ) -> tuple[User, EmailAddress]:
-        """Create new User, primary EmailAddress, and PasswordCredential within the session."""
+        """Create new User, EmailAddress, and PasswordCredential in session without committing."""
         clean_email = email.strip().lower()
 
-        # Check if email already exists
         existing = await self.get_user_by_email(session, clean_email)
         if existing:
             raise ValueError("An account with this email address already exists.")
@@ -136,36 +136,15 @@ class SQLAlchemyAdapter:
 
         credential = self.credential_model(
             user_id=user.id,
-            hashed_password=hash_password(password),
+            hashed_password=hashed_password,
             password_updated_at=utc_now(),
+            credential_version=1,
         )
         session.add(credential)
         await session.flush()
         await session.refresh(user)
 
         return user, email_record
-
-    async def authenticate_user(
-        self, session: AsyncSession, email: str, password: str
-    ) -> User | None:
-        """Verify password credentials for a user by email."""
-        user = await self.get_user_by_email(session, email)
-        if not user or not user.is_active:
-            return None
-
-        # Fetch credential
-        stmt = select(self.credential_model).where(
-            self.credential_model.user_id == user.id
-        )
-        result = await session.execute(stmt)
-        cred = result.scalars().first()
-        if not cred:
-            return None
-
-        if not verify_password(password, cred.hashed_password):
-            return None
-
-        return user
 
     async def verify_email(
         self, session: AsyncSession, email: str
@@ -191,7 +170,7 @@ class SQLAlchemyAdapter:
         ip_address: str | None = None,
         user_agent: str | None = None,
     ) -> Session:
-        """Create a new active session record storing the hashed token."""
+        """Create a new active session record storing hashed token."""
         token_id = hash_token(raw_token)
         expires_at = utc_now() + timedelta(seconds=max_age_seconds)
 
@@ -209,7 +188,7 @@ class SQLAlchemyAdapter:
     async def get_session_and_user(
         self, session: AsyncSession, raw_token: str
     ) -> tuple[Session, User] | None:
-        """Retrieve active unexpired session and its associated user by raw token."""
+        """Retrieve active unexpired session and user by raw token."""
         token_id = hash_token(raw_token)
         stmt = (
             select(self.session_model, self.user_model)
@@ -251,107 +230,6 @@ class SQLAlchemyAdapter:
         )
         return int(count)
 
-    async def update_user_password(
-        self, session: AsyncSession, user_id: uuid.UUID, new_password: str
-    ) -> bool:
-        """Update a user's password credential and invalidate all existing sessions."""
-        now = utc_now()
-        stmt = select(self.credential_model).where(
-            self.credential_model.user_id == user_id
-        )
-        result = await session.execute(stmt)
-        cred = result.scalars().first()
-        if not cred:
-            user = await self.get_user_by_id(session, user_id)
-            if not user:
-                return False
-            cred = self.credential_model(
-                user_id=user_id,
-                hashed_password=hash_password(new_password),
-                password_updated_at=now,
-            )
-            session.add(cred)
-        else:
-            cred.hashed_password = hash_password(new_password)
-            cred.password_updated_at = now
-
-        await session.flush()
-        # Security invariant: Revoke all active sessions upon password reset
-        await self.revoke_all_user_sessions(session, user_id)
-        return True
-
-    async def atomic_reset_password(
-        self,
-        session: AsyncSession,
-        user_id: uuid.UUID,
-        expected_pwd_ts: int,
-        new_password: str,
-    ) -> bool:
-        """Atomically verify expected password timestamp and update password with CAS semantics."""
-        if expected_pwd_ts <= 0:
-            return False
-
-        # Lock the row for update where supported (Postgres/MySQL)
-        stmt = (
-            select(self.credential_model)
-            .where(self.credential_model.user_id == user_id)
-            .with_for_update()
-        )
-        result = await session.execute(stmt)
-        cred = result.scalars().first()
-        if not cred or cred.password_updated_at is None:
-            return False
-
-        current_ts = int(cred.password_updated_at.timestamp() * 1_000_000)
-        if current_ts != expected_pwd_ts or current_ts == 0:
-            return False
-
-        now = utc_now()
-        # Atomic Compare-And-Swap update statement
-        update_stmt = (
-            update(self.credential_model)
-            .where(
-                self.credential_model.user_id == user_id,
-                self.credential_model.password_updated_at == cred.password_updated_at,
-            )
-            .values(
-                hashed_password=hash_password(new_password),
-                password_updated_at=now,
-            )
-        )
-        update_res = await session.execute(update_stmt)
-        rowcount = (
-            update_res.rowcount
-            if isinstance(update_res, CursorResult)
-            else (getattr(update_res, "rowcount", 0) or 0)
-        )
-        if rowcount != 1:
-            return False
-
-        await session.flush()
-        await self.revoke_all_user_sessions(session, user_id)
-        return True
-
-    async def verify_and_update_password(
-        self,
-        session: AsyncSession,
-        user_id: uuid.UUID,
-        current_password: str,
-        new_password: str,
-    ) -> bool:
-        """Verify the current password and update to a new password."""
-        stmt = select(self.credential_model).where(
-            self.credential_model.user_id == user_id
-        )
-        result = await session.execute(stmt)
-        cred = result.scalars().first()
-        if not cred or not verify_password(current_password, cred.hashed_password):
-            return False
-        cred.hashed_password = hash_password(new_password)
-        cred.password_updated_at = utc_now()
-        await session.flush()
-        return True
-
     async def revoke_other_user_sessions(
         self, session: AsyncSession, user_id: uuid.UUID, current_raw_token: str
     ) -> int:
@@ -368,3 +246,81 @@ class SQLAlchemyAdapter:
             else (getattr(result, "rowcount", 0) or 0)
         )
         return int(count)
+
+    async def update_password_if_version(
+        self,
+        session: AsyncSession,
+        user_id: uuid.UUID,
+        expected_version: int,
+        new_hashed_password: str,
+    ) -> bool:
+        """Update password with Compare-And-Swap on credential_version and increment version."""
+        if type(expected_version) is not int or expected_version < 1:
+            return False
+
+        now = utc_now()
+        stmt = (
+            update(self.credential_model)
+            .where(
+                self.credential_model.user_id == user_id,
+                self.credential_model.credential_version == expected_version,
+            )
+            .values(
+                hashed_password=new_hashed_password,
+                password_updated_at=now,
+                updated_at=now,
+                credential_version=expected_version + 1,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        res = await session.execute(stmt)
+        rowcount = (
+            res.rowcount
+            if isinstance(res, CursorResult)
+            else (getattr(res, "rowcount", 0) or 0)
+        )
+        if rowcount != 1:
+            return False
+
+        await session.flush()
+        return True
+
+    async def atomic_reset_password(
+        self,
+        session: AsyncSession,
+        user_id: uuid.UUID,
+        expected_cred_v: int,
+        new_hashed_password: str,
+    ) -> bool:
+        """Atomically verify credential_version CAS, update password, increment version and revoke sessions."""
+        if type(expected_cred_v) is not int or expected_cred_v < 1:
+            return False
+
+        now = utc_now()
+        update_stmt = (
+            update(self.credential_model)
+            .where(
+                self.credential_model.user_id == user_id,
+                self.credential_model.credential_version == expected_cred_v,
+            )
+            .values(
+                hashed_password=new_hashed_password,
+                password_updated_at=now,
+                updated_at=now,
+                credential_version=expected_cred_v + 1,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        update_res = await session.execute(update_stmt)
+        rowcount = (
+            update_res.rowcount
+            if isinstance(update_res, CursorResult)
+            else (getattr(update_res, "rowcount", 0) or 0)
+        )
+        if rowcount != 1:
+            return False
+
+        await session.flush()
+        # Security invariant: Revoke all active sessions upon password reset
+        await self.revoke_all_user_sessions(session, user_id)
+        return True

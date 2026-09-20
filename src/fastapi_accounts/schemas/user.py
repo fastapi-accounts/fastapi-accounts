@@ -10,6 +10,7 @@ class EmailAddressRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
+    user_id: uuid.UUID | None = None
     email: str
     is_verified: bool
     is_primary: bool
@@ -26,6 +27,7 @@ class UserRead(BaseModel):
     is_active: bool
     is_superuser: bool
     created_at: datetime
+    updated_at: datetime | None = None
     emails: list[EmailAddressRead] = []
 
 

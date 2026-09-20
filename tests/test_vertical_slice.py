@@ -3,6 +3,7 @@ from fastapi import Depends, FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from fastapi_accounts.core import FastAPIAccounts
+from fastapi_accounts.schemas.principal import UserPrincipal
 
 
 @pytest.mark.asyncio
@@ -11,8 +12,10 @@ async def test_cookie_transport_vertical_slice(cookie_accounts: FastAPIAccounts)
     app.include_router(cookie_accounts.router, prefix="/api/v1/auth")
 
     @app.get("/protected")
-    async def protected_endpoint(user=Depends(cookie_accounts.current_active_user)):
-        return {"user_id": str(user.id), "email": user.primary_email}
+    async def protected_endpoint(
+        user: UserPrincipal = Depends(cookie_accounts.current_active_user),
+    ):
+        return {"user_id": str(user.id), "email": user.email}
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -23,7 +26,7 @@ async def test_cookie_transport_vertical_slice(cookie_accounts: FastAPIAccounts)
         )
         assert reg_resp.status_code == 201
         reg_data = reg_resp.json()
-        assert reg_data["primary_email"] == "alice@example.com"
+        assert reg_data["emails"][0]["email"] == "alice@example.com"
         assert reg_data["emails"][0]["is_verified"] is False
 
         # 2. Duplicate registration should fail
@@ -42,21 +45,23 @@ async def test_cookie_transport_vertical_slice(cookie_accounts: FastAPIAccounts)
         assert req_verify_resp.status_code == 200
 
         # 4. Verify email with token
-        token = cookie_accounts.generate_email_verification_token("alice@example.com")
+        token = cookie_accounts.service.generate_email_verification_token(
+            "alice@example.com"
+        )
         verify_resp = await client.post(
             "/api/v1/auth/verify-email",
             json={"token": token},
         )
         assert verify_resp.status_code == 200
 
-        # 4. Login with wrong password should fail
+        # 5. Login with wrong password should fail
         bad_login = await client.post(
             "/api/v1/auth/login",
             json={"email": "alice@example.com", "password": "WrongPassword!"},
         )
         assert bad_login.status_code == 401
 
-        # 5. Login with correct password
+        # 6. Login with correct password
         login_resp = await client.post(
             "/api/v1/auth/login",
             json={"email": "alice@example.com", "password": "SecurePassword123!"},
@@ -64,21 +69,21 @@ async def test_cookie_transport_vertical_slice(cookie_accounts: FastAPIAccounts)
         assert login_resp.status_code == 200
         assert "fastapi_accounts_session" in login_resp.cookies
 
-        # 6. Access protected route with cookie
+        # 7. Access protected route with cookie
         me_resp = await client.get("/protected")
         assert me_resp.status_code == 200
         assert me_resp.json()["email"] == "alice@example.com"
 
-        # 7. Access /me endpoint
+        # 8. Access /me endpoint
         profile_resp = await client.get("/api/v1/auth/me")
         assert profile_resp.status_code == 200
-        assert profile_resp.json()["primary_email"] == "alice@example.com"
+        assert profile_resp.json()["emails"][0]["email"] == "alice@example.com"
 
-        # 8. Logout
+        # 9. Logout
         logout_resp = await client.post("/api/v1/auth/logout")
         assert logout_resp.status_code == 200
 
-        # 9. Access protected route after logout without valid session
+        # 10. Access protected route after logout without valid session
         unauth_client = AsyncClient(transport=transport, base_url="http://test")
         unauth_resp = await unauth_client.get("/protected")
         assert unauth_resp.status_code == 401
@@ -90,8 +95,10 @@ async def test_bearer_transport_vertical_slice(bearer_accounts: FastAPIAccounts)
     app.include_router(bearer_accounts.router, prefix="/api/v1/auth")
 
     @app.get("/protected")
-    async def protected_endpoint(user=Depends(bearer_accounts.current_active_user)):
-        return {"email": user.primary_email}
+    async def protected_endpoint(
+        user: UserPrincipal = Depends(bearer_accounts.current_active_user),
+    ):
+        return {"email": user.email}
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
