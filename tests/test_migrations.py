@@ -543,65 +543,119 @@ def test_inspect_legacy_schema_outcomes():
                 )
             )
 
-        # 7. Check constraint with non-positive predicate (<= 0) -> UNKNOWN
-        with tempfile.TemporaryDirectory() as td:
-            eng = create_engine(f"sqlite:///{td}/bad_ck.db")
-            meta_bad_ck = clone_metadata()
-            set_check_constraint(
-                meta_bad_ck.tables["password_credentials"],
-                "credential_version <= 0",
-                "ck_bad",
+        def set_composite_pk(table: sa.Table, col_name: str) -> None:
+            for c in list(table.constraints):
+                if isinstance(c, sa.PrimaryKeyConstraint):
+                    table.constraints.remove(c)
+            table.append_constraint(
+                sa.PrimaryKeyConstraint(table.c.id, table.c[col_name])
             )
-            meta_bad_ck.create_all(eng)
-            with eng.connect() as conn:
-                assert inspect_legacy_schema(conn).state == SchemaState.UNKNOWN
-            eng.dispose()
 
-        # 8. Check constraint with tautology (1=1) -> UNKNOWN
-        with tempfile.TemporaryDirectory() as td:
-            eng = create_engine(f"sqlite:///{td}/tautology_ck.db")
-            meta_tautology = clone_metadata()
-            set_check_constraint(
-                meta_tautology.tables["password_credentials"],
-                "1=1",
-                "ck_password_credentials_credential_version_positive",
-            )
-            meta_tautology.create_all(eng)
-            with eng.connect() as conn:
-                assert inspect_legacy_schema(conn).state == SchemaState.UNKNOWN
-            eng.dispose()
+        def assert_mutation_rejected_both_modes(mut_fn, label: str) -> None:
+            # Mode A: Unmanaged schema
+            with tempfile.TemporaryDirectory() as td:
+                eng = create_engine(f"sqlite:///{td}/unmanaged_{label}.db")
+                m = clone_metadata()
+                mut_fn(m)
+                m.create_all(eng)
+                with eng.connect() as conn:
+                    res = inspect_legacy_schema(conn)
+                    assert res.state == SchemaState.UNKNOWN, (
+                        f"Unmanaged mutation {label} expected UNKNOWN, got {res.state}"
+                    )
+                eng.dispose()
 
-        # 9. NUMERIC column type for credential_version -> UNKNOWN
-        with tempfile.TemporaryDirectory() as td:
-            eng = create_engine(f"sqlite:///{td}/numeric.db")
-            meta_num = clone_metadata()
-            meta_num.tables[
-                "password_credentials"
-            ].c.credential_version.type = sa.Numeric()
-            meta_num.create_all(eng)
-            with eng.connect() as conn:
-                assert inspect_legacy_schema(conn).state == SchemaState.UNKNOWN
-            eng.dispose()
+            # Mode B: Managed (0005) schema
+            with tempfile.TemporaryDirectory() as td:
+                eng = create_engine(f"sqlite:///{td}/managed_{label}.db")
+                m = clone_metadata()
+                mut_fn(m)
+                m.create_all(eng)
+                with eng.connect() as conn:
+                    conn.execute(
+                        text(
+                            "CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY)"
+                        )
+                    )
+                    conn.execute(
+                        text(
+                            "INSERT INTO alembic_version (version_num) VALUES ('0005_add_session_credential_version')"
+                        )
+                    )
+                    conn.commit()
+                    res = inspect_legacy_schema(conn)
+                    assert res.state == SchemaState.UNKNOWN, (
+                        f"Managed 0005 mutation {label} expected UNKNOWN, got {res.state}"
+                    )
+                eng.dispose()
 
-        # 10. Composite uniqueness on email -> UNKNOWN
-        with tempfile.TemporaryDirectory() as td:
-            eng = create_engine(f"sqlite:///{td}/composite_email.db")
-            meta_comp_email = clone_metadata()
-            tbl = meta_comp_email.tables["email_addresses"]
-            for idx in list(tbl.indexes):
-                if idx.unique:
-                    tbl.indexes.remove(idx)
-            for c in list(tbl.constraints):
-                if isinstance(c, sa.UniqueConstraint):
-                    tbl.constraints.remove(c)
-            sa.Index("ix_comp_email", tbl.c.email, tbl.c.user_id, unique=True)
-            meta_comp_email.create_all(eng)
-            with eng.connect() as conn:
-                assert inspect_legacy_schema(conn).state == SchemaState.UNKNOWN
-            eng.dispose()
-
-        # 11-14. TIME types instead of TIMESTAMP/DATETIME -> UNKNOWN
-        time_variants = [
+        mutations = [
+            # 1. Composite primary keys across all 4 tables
+            (
+                "users_composite_pk",
+                lambda m: set_composite_pk(m.tables["users"], "created_at"),
+            ),
+            (
+                "email_composite_pk",
+                lambda m: set_composite_pk(m.tables["email_addresses"], "user_id"),
+            ),
+            (
+                "sessions_composite_pk",
+                lambda m: set_composite_pk(m.tables["sessions"], "user_id"),
+            ),
+            (
+                "creds_composite_pk",
+                lambda m: set_composite_pk(m.tables["password_credentials"], "user_id"),
+            ),
+            # 2. Check constraints
+            (
+                "bad_ck_negative",
+                lambda m: set_check_constraint(
+                    m.tables["password_credentials"],
+                    "credential_version <= 0",
+                    "ck_bad",
+                ),
+            ),
+            (
+                "tautology_ck",
+                lambda m: set_check_constraint(
+                    m.tables["password_credentials"],
+                    "1=1",
+                    "ck_password_credentials_credential_version_positive",
+                ),
+            ),
+            # 3. Numeric credential version
+            (
+                "numeric_cred_v",
+                lambda m: setattr(
+                    m.tables["password_credentials"].c.credential_version,
+                    "type",
+                    sa.Numeric(),
+                ),
+            ),
+            # 4. Composite email uniqueness
+            (
+                "composite_email_unique",
+                lambda m: (
+                    [
+                        m.tables["email_addresses"].indexes.remove(idx)
+                        for idx in list(m.tables["email_addresses"].indexes)
+                        if idx.unique
+                    ],
+                    [
+                        m.tables["email_addresses"].constraints.remove(c)
+                        for c in list(m.tables["email_addresses"].constraints)
+                        if isinstance(c, sa.UniqueConstraint)
+                    ],
+                    sa.Index(
+                        "ix_comp_email",
+                        m.tables["email_addresses"].c.email,
+                        m.tables["email_addresses"].c.user_id,
+                        unique=True,
+                    ),
+                ),
+            ),
+            # 5. TIME types instead of TIMESTAMP/DATETIME
             (
                 "password_updated_at_TIME",
                 lambda m: setattr(
@@ -624,21 +678,7 @@ def test_inspect_legacy_schema_outcomes():
                 "session_expires_at_TIME",
                 lambda m: setattr(m.tables["sessions"].c.expires_at, "type", sa.Time()),
             ),
-        ]
-        for name, mut in time_variants:
-            with tempfile.TemporaryDirectory() as td:
-                eng = create_engine(f"sqlite:///{td}/time_{name}.db")
-                m = clone_metadata()
-                mut(m)
-                m.create_all(eng)
-                with eng.connect() as conn:
-                    assert inspect_legacy_schema(conn).state == SchemaState.UNKNOWN, (
-                        f"Failed for {name}"
-                    )
-                eng.dispose()
-
-        # 15-18. Short string types (String(1)) instead of UUID/ID/Email/Hash -> UNKNOWN
-        short_str_variants = [
+            # 6. Undersized string contracts
             (
                 "user_id_short_string",
                 lambda m: setattr(m.tables["users"].c.id, "type", sa.String(1)),
@@ -650,34 +690,67 @@ def test_inspect_legacy_schema_outcomes():
                 ),
             ),
             (
-                "email_short_string",
+                "email_short_string_1",
                 lambda m: setattr(
                     m.tables["email_addresses"].c.email, "type", sa.String(1)
                 ),
             ),
             (
-                "password_hash_short_string",
+                "email_short_string_32",
+                lambda m: setattr(
+                    m.tables["email_addresses"].c.email, "type", sa.String(32)
+                ),
+            ),
+            (
+                "password_hash_short_string_1",
                 lambda m: setattr(
                     m.tables["password_credentials"].c.hashed_password,
                     "type",
                     sa.String(1),
                 ),
             ),
-        ]
-        for name, mut in short_str_variants:
-            with tempfile.TemporaryDirectory() as td:
-                eng = create_engine(f"sqlite:///{td}/str_{name}.db")
-                m = clone_metadata()
-                mut(m)
-                m.create_all(eng)
-                with eng.connect() as conn:
-                    assert inspect_legacy_schema(conn).state == SchemaState.UNKNOWN, (
-                        f"Failed for {name}"
-                    )
-                eng.dispose()
-
-        # 19-20. Wrong Foreign Key Target (pointing to users.is_active instead of users.id) -> UNKNOWN
-        fk_variants = [
+            (
+                "password_hash_short_string_32",
+                lambda m: setattr(
+                    m.tables["password_credentials"].c.hashed_password,
+                    "type",
+                    sa.String(32),
+                ),
+            ),
+            (
+                "password_hash_short_string_255",
+                lambda m: setattr(
+                    m.tables["password_credentials"].c.hashed_password,
+                    "type",
+                    sa.String(255),
+                ),
+            ),
+            (
+                "session_id_short_string_32",
+                lambda m: setattr(m.tables["sessions"].c.id, "type", sa.String(32)),
+            ),
+            # 7. Optional session columns invalid types and non-nullable mutations
+            (
+                "session_ip_integer",
+                lambda m: setattr(
+                    m.tables["sessions"].c.ip_address, "type", sa.Integer()
+                ),
+            ),
+            (
+                "session_ua_integer",
+                lambda m: setattr(
+                    m.tables["sessions"].c.user_agent, "type", sa.Integer()
+                ),
+            ),
+            (
+                "session_ip_not_null",
+                lambda m: setattr(m.tables["sessions"].c.ip_address, "nullable", False),
+            ),
+            (
+                "session_ua_not_null",
+                lambda m: setattr(m.tables["sessions"].c.user_agent, "nullable", False),
+            ),
+            # 8. Foreign key targets
             (
                 "email_fk_wrong_target",
                 lambda m: replace_fk(m.tables["email_addresses"], "users", "is_active"),
@@ -686,18 +759,56 @@ def test_inspect_legacy_schema_outcomes():
                 "session_fk_wrong_target",
                 lambda m: replace_fk(m.tables["sessions"], "users", "is_active"),
             ),
+            (
+                "creds_fk_wrong_target",
+                lambda m: replace_fk(
+                    m.tables["password_credentials"], "users", "is_active"
+                ),
+            ),
         ]
-        for name, mut in fk_variants:
-            with tempfile.TemporaryDirectory() as td:
-                eng = create_engine(f"sqlite:///{td}/fk_{name}.db")
-                m = clone_metadata()
-                mut(m)
-                m.create_all(eng)
-                with eng.connect() as conn:
-                    assert inspect_legacy_schema(conn).state == SchemaState.UNKNOWN, (
-                        f"Failed for {name}"
+
+        for label, mut_fn in mutations:
+            assert_mutation_rejected_both_modes(mut_fn, label)
+
+        # 9. Positive controls: Unbounded TEXT supported across all string columns
+        with tempfile.TemporaryDirectory() as td:
+            eng = create_engine(f"sqlite:///{td}/text_positive_unmanaged.db")
+            m = clone_metadata()
+            m.tables["email_addresses"].c.email.type = sa.Text()
+            m.tables["password_credentials"].c.hashed_password.type = sa.Text()
+            m.tables["sessions"].c.id.type = sa.Text()
+            m.tables["sessions"].c.ip_address.type = sa.Text()
+            m.tables["sessions"].c.user_agent.type = sa.Text()
+            m.create_all(eng)
+            with eng.connect() as conn:
+                res = inspect_legacy_schema(conn)
+                assert res.state == SchemaState.UNVERSIONED_CURRENT
+            eng.dispose()
+
+        with tempfile.TemporaryDirectory() as td:
+            eng = create_engine(f"sqlite:///{td}/text_positive_managed.db")
+            m = clone_metadata()
+            m.tables["email_addresses"].c.email.type = sa.Text()
+            m.tables["password_credentials"].c.hashed_password.type = sa.Text()
+            m.tables["sessions"].c.id.type = sa.Text()
+            m.tables["sessions"].c.ip_address.type = sa.Text()
+            m.tables["sessions"].c.user_agent.type = sa.Text()
+            m.create_all(eng)
+            with eng.connect() as conn:
+                conn.execute(
+                    text(
+                        "CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY)"
                     )
-                eng.dispose()
+                )
+                conn.execute(
+                    text(
+                        "INSERT INTO alembic_version (version_num) VALUES ('0005_add_session_credential_version')"
+                    )
+                )
+                conn.commit()
+                res = inspect_legacy_schema(conn)
+                assert res.state == SchemaState.ALEMBIC_MANAGED
+            eng.dispose()
 
 
 def test_get_alembic_config_helper_percent_escaping():

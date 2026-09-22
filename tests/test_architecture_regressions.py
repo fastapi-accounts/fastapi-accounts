@@ -1,6 +1,8 @@
+import uuid
 from collections.abc import AsyncGenerator
 
 import pytest
+import sqlalchemy as sa
 from fastapi import Depends, FastAPI
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
@@ -663,3 +665,79 @@ async def test_callable_object_callbacks_and_hook_error_containment(
     assert len(notifier.invocations) == 1
     assert len(hook.invocations) == 1
     assert hook.invocations[0] == "register:callable_hook@example.com"
+
+
+@pytest.mark.asyncio
+async def test_create_session_returns_persistent_orm_instance(
+    cookie_accounts: FastAPIAccounts,
+):
+    """F4 / Architecture: Verify create_session returns persistent ORM instances in identity map across both branches."""
+    async with cookie_accounts.adapter.session_maker() as session:
+        user, _ = await cookie_accounts.adapter.create_user_with_password(
+            session=session,
+            email="orm_persist@example.com",
+            hashed_password="$argon2id$mockhash",
+            is_verified=True,
+        )
+        await session.commit()
+        user_id = user.id
+
+    # 1. Expected credential version branch (explicit generation)
+    async with cookie_accounts.adapter.session_maker() as session:
+        sess_rec1 = await cookie_accounts.adapter.create_session(
+            session=session,
+            user_id=user_id,
+            raw_token="raw_tok_test_versioned_123",
+            expected_credential_version=1,
+        )
+        insp1 = sa.inspect(sess_rec1)
+        assert insp1.persistent is True
+        assert insp1.transient is False
+
+        # Verify identity map returns identical object instance
+        queried1 = (
+            (await session.execute(select(Session).where(Session.id == sess_rec1.id)))
+            .scalars()
+            .first()
+        )
+        assert queried1 is sess_rec1
+
+        # Assert version mismatch raises ValueError cleanly
+        with pytest.raises(
+            ValueError, match="Credential version mismatch during session creation"
+        ):
+            await cookie_accounts.adapter.create_session(
+                session=session,
+                user_id=user_id,
+                raw_token="raw_tok_test_mismatch_123",
+                expected_credential_version=99,
+            )
+
+    # 2. Omitted credential version branch (unversioned fallback)
+    async with cookie_accounts.adapter.session_maker() as session:
+        sess_rec2 = await cookie_accounts.adapter.create_session(
+            session=session,
+            user_id=user_id,
+            raw_token="raw_tok_test_unversioned_456",
+            expected_credential_version=None,
+        )
+        insp2 = sa.inspect(sess_rec2)
+        assert insp2.persistent is True
+        assert insp2.transient is False
+
+        # Verify identity map returns identical object instance
+        queried2 = (
+            (await session.execute(select(Session).where(Session.id == sess_rec2.id)))
+            .scalars()
+            .first()
+        )
+        assert queried2 is sess_rec2
+
+        # Assert missing user raises ValueError cleanly
+        with pytest.raises(ValueError, match="Failed creating session for user"):
+            await cookie_accounts.adapter.create_session(
+                session=session,
+                user_id=uuid.uuid4(),
+                raw_token="raw_tok_test_missing_user_789",
+                expected_credential_version=None,
+            )

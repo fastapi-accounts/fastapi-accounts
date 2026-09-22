@@ -235,10 +235,10 @@ def inspect_legacy_schema(connection: Connection) -> SchemaInspectionResult:
                 details={"table": "users", "error": "Invalid timestamp types"},
             )
         user_pk = inspector.get_pk_constraint("users")
-        if not user_pk or "id" not in user_pk.get("constrained_columns", []):
+        if not user_pk or list(user_pk.get("constrained_columns") or []) != ["id"]:
             return SchemaInspectionResult(
                 state=SchemaState.UNKNOWN,
-                details={"table": "users", "error": "Missing primary key"},
+                details={"table": "users", "error": "Missing or invalid primary key"},
             )
 
         # 2. Inspect email_addresses table
@@ -268,7 +268,7 @@ def inspect_legacy_schema(connection: Connection) -> SchemaInspectionResult:
         if (
             not _is_string_type(email_cols["id"]["type"], min_length=32)
             or not _is_string_type(email_cols["user_id"]["type"], min_length=32)
-            or not _is_string_type(email_cols["email"]["type"], min_length=32)
+            or not _is_string_type(email_cols["email"]["type"], min_length=320)
         ):
             return SchemaInspectionResult(
                 state=SchemaState.UNKNOWN,
@@ -290,10 +290,13 @@ def inspect_legacy_schema(connection: Connection) -> SchemaInspectionResult:
                 details={"table": "email_addresses", "error": "Invalid timestamp type"},
             )
         email_pk = inspector.get_pk_constraint("email_addresses")
-        if not email_pk or "id" not in email_pk.get("constrained_columns", []):
+        if not email_pk or list(email_pk.get("constrained_columns") or []) != ["id"]:
             return SchemaInspectionResult(
                 state=SchemaState.UNKNOWN,
-                details={"table": "email_addresses", "error": "Missing primary key"},
+                details={
+                    "table": "email_addresses",
+                    "error": "Missing or invalid primary key",
+                },
             )
         email_fks = inspector.get_foreign_keys("email_addresses")
         if not _has_fk_to_users_id(email_fks, "user_id"):
@@ -345,9 +348,23 @@ def inspect_legacy_schema(connection: Connection) -> SchemaInspectionResult:
                         "error": f"Column {col_name} is nullable",
                     },
                 )
-        if not _is_string_type(
-            session_cols["id"]["type"], min_length=32
-        ) or not _is_string_type(session_cols["user_id"]["type"], min_length=32):
+        if (
+            session_cols["ip_address"]["nullable"] is not True
+            or session_cols["user_agent"]["nullable"] is not True
+        ):
+            return SchemaInspectionResult(
+                state=SchemaState.UNKNOWN,
+                details={
+                    "table": "sessions",
+                    "error": "Optional session columns ip_address and user_agent must be nullable",
+                },
+            )
+        if (
+            not _is_string_type(session_cols["id"]["type"], min_length=64)
+            or not _is_string_type(session_cols["user_id"]["type"], min_length=32)
+            or not _is_string_type(session_cols["ip_address"]["type"], min_length=45)
+            or not _is_string_type(session_cols["user_agent"]["type"], min_length=512)
+        ):
             return SchemaInspectionResult(
                 state=SchemaState.UNKNOWN,
                 details={"table": "sessions", "error": "Invalid string column types"},
@@ -360,10 +377,15 @@ def inspect_legacy_schema(connection: Connection) -> SchemaInspectionResult:
                 details={"table": "sessions", "error": "Invalid timestamp types"},
             )
         session_pk = inspector.get_pk_constraint("sessions")
-        if not session_pk or "id" not in session_pk.get("constrained_columns", []):
+        if not session_pk or list(session_pk.get("constrained_columns") or []) != [
+            "id"
+        ]:
             return SchemaInspectionResult(
                 state=SchemaState.UNKNOWN,
-                details={"table": "sessions", "error": "Missing primary key"},
+                details={
+                    "table": "sessions",
+                    "error": "Missing or invalid primary key",
+                },
             )
         session_fks = inspector.get_foreign_keys("sessions")
         if not _has_fk_to_users_id(session_fks, "user_id"):
@@ -404,7 +426,9 @@ def inspect_legacy_schema(connection: Connection) -> SchemaInspectionResult:
         if (
             not _is_string_type(cred_cols["id"]["type"], min_length=32)
             or not _is_string_type(cred_cols["user_id"]["type"], min_length=32)
-            or not _is_string_type(cred_cols["hashed_password"]["type"], min_length=32)
+            or not _is_string_type(
+                cred_cols["hashed_password"]["type"], min_length=1024
+            )
         ):
             return SchemaInspectionResult(
                 state=SchemaState.UNKNOWN,
@@ -424,12 +448,12 @@ def inspect_legacy_schema(connection: Connection) -> SchemaInspectionResult:
                 },
             )
         cred_pk = inspector.get_pk_constraint("password_credentials")
-        if not cred_pk or "id" not in cred_pk.get("constrained_columns", []):
+        if not cred_pk or list(cred_pk.get("constrained_columns") or []) != ["id"]:
             return SchemaInspectionResult(
                 state=SchemaState.UNKNOWN,
                 details={
                     "table": "password_credentials",
-                    "error": "Missing primary key",
+                    "error": "Missing or invalid primary key",
                 },
             )
         cred_fks = inspector.get_foreign_keys("password_credentials")

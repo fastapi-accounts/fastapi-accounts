@@ -902,8 +902,8 @@ async def test_rate_limiter_expired_key_renewal_under_capacity():
 
 
 @pytest.mark.asyncio
-async def test_login_reset_adapter_flush_boundary_race():
-    """F1 / High: Concurrency race when session insertion is delayed at flush boundary.
+async def test_login_reset_adapter_entry_interleaving_race():
+    """F1 / High: Concurrency race when session creation is intercepted at the adapter entry boundary after password verification.
 
     Even if an in-flight login executes after verifying an older credential version,
     the issued session has sessions.credential_version = 1.

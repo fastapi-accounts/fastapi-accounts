@@ -249,16 +249,13 @@ class SQLAlchemyAdapter:
             if count != 1:
                 raise ValueError("Credential version mismatch during session creation")
 
-            session_record = self.session_model(
-                id=token_id,
-                user_id=user_id,
-                credential_version=expected_credential_version,
-                created_at=now,
-                expires_at=expires_at,
-                ip_address=ip_address,
-                user_agent=user_agent,
+            query_stmt = select(self.session_model).where(
+                self.session_model.id == token_id
             )
-            return session_record
+            session_res: Any = (await session.execute(query_stmt)).scalars().first()
+            if not session_res:
+                raise ValueError("Failed reading inserted session record")
+            return session_res
         else:
             select_stmt = (
                 select(
@@ -304,17 +301,9 @@ class SQLAlchemyAdapter:
             query_stmt = select(self.session_model).where(
                 self.session_model.id == token_id
             )
-            session_res: Any = (await session.execute(query_stmt)).scalars().first()
+            session_res = (await session.execute(query_stmt)).scalars().first()
             if not session_res:
-                session_res = self.session_model(
-                    id=token_id,
-                    user_id=user_id,
-                    credential_version=1,
-                    created_at=now,
-                    expires_at=expires_at,
-                    ip_address=ip_address,
-                    user_agent=user_agent,
-                )
+                raise ValueError("Failed reading inserted session record")
             return session_res
 
     async def get_session_and_user(
