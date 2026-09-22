@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any
@@ -62,6 +63,61 @@ def _is_int_type(col_type: Any) -> bool:
     return any(k in t for k in ("INT", "INTEGER", "BIGINT", "SMALLINT", "TINYINT"))
 
 
+def _normalize_predicate(sqltext: str) -> str:
+    """Normalize SQL constraint text by stripping quotes, whitespace, and wrapping parens."""
+    s = sqltext.strip()
+    while s.startswith("(") and s.endswith(")"):
+        depth = 0
+        matched = False
+        for i, c in enumerate(s):
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+                if depth == 0 and i == len(s) - 1:
+                    matched = True
+                    break
+                elif depth == 0:
+                    break
+        if matched:
+            s = s[1:-1].strip()
+        else:
+            break
+    s = s.replace('"', "").replace("`", "").replace("'", "")
+    s = re.sub(r"\s+", "", s).lower()
+    return s
+
+
+def _is_valid_positive_cred_v_predicate(sqltext: str) -> bool:
+    if not sqltext:
+        return False
+    norm = _normalize_predicate(sqltext)
+    if any(forbidden in norm for forbidden in ("or", "and", "1=1", "true", "<=", "<")):
+        return False
+    return norm in ("credential_version>=1", "credential_version>0")
+
+
+def _extract_sqlite_check_predicates(table_sql: str) -> list[str]:
+    checks = []
+    pattern = re.compile(r"\bCHECK\s*\(", re.IGNORECASE)
+    for m in pattern.finditer(table_sql):
+        start = m.end() - 1
+        depth = 0
+        end = -1
+        for i in range(start, len(table_sql)):
+            if table_sql[i] == "(":
+                depth += 1
+            elif table_sql[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+        if end != -1:
+            expr = table_sql[start + 1 : end]
+            checks.append(expr)
+    return checks
+
+
 def _has_positive_credential_version_check(
     connection: Connection, inspector: Any
 ) -> bool:
@@ -69,23 +125,8 @@ def _has_positive_credential_version_check(
     try:
         cks = inspector.get_check_constraints("password_credentials")
         for ck in cks or []:
-            sqltext = str(ck.get("sqltext") or "").lower()
-            name = str(ck.get("name") or "").lower()
-            has_col = (
-                "credential_version" in sqltext
-                or "ck_password_credentials_credential_version" in name
-            )
-            is_pos = (
-                "credential_version >= 1" in sqltext
-                or "credential_version > 0" in sqltext
-                or "credential_version>=1" in sqltext
-                or "credential_version>0" in sqltext
-                or "ck_password_credentials_credential_version_positive" in name
-            )
-            is_valid = (
-                "<= 0" not in sqltext and "< 1" not in sqltext and "<= 1" not in sqltext
-            )
-            if has_col and is_pos and is_valid:
+            sqltext = str(ck.get("sqltext") or "").strip()
+            if sqltext and _is_valid_positive_cred_v_predicate(sqltext):
                 return True
     except (NotImplementedError, AttributeError, SQLAlchemyError) as e:
         logger.debug("Check constraint reflection unavailable: %s", e)
@@ -99,16 +140,9 @@ def _has_positive_credential_version_check(
                 )
             ).scalar()
             if res:
-                sql_lower = str(res).lower()
-                is_pos = (
-                    "credential_version >= 1" in sql_lower
-                    or "credential_version > 0" in sql_lower
-                    or "credential_version>=1" in sql_lower
-                    or "credential_version>0" in sql_lower
-                )
-                is_valid = "<= 0" not in sql_lower and "< 1" not in sql_lower
-                if is_pos and is_valid:
-                    return True
+                for expr in _extract_sqlite_check_predicates(str(res)):
+                    if _is_valid_positive_cred_v_predicate(expr):
+                        return True
     except SQLAlchemyError as e:
         logger.debug("sqlite_master DDL query unavailable: %s", e)
 
@@ -251,9 +285,9 @@ def inspect_legacy_schema(connection: Connection) -> SchemaInspectionResult:
         email_uqs = inspector.get_unique_constraints("email_addresses")
         email_idxs = inspector.get_indexes("email_addresses")
         has_unique_email = any(
-            "email" in uq.get("column_names", []) for uq in email_uqs
+            uq.get("column_names") == ["email"] for uq in email_uqs
         ) or any(
-            idx.get("unique") and "email" in idx.get("column_names", [])
+            idx.get("unique") and idx.get("column_names") == ["email"]
             for idx in email_idxs
         )
         if not has_unique_email:
@@ -321,10 +355,10 @@ def inspect_legacy_schema(connection: Connection) -> SchemaInspectionResult:
             )
         session_indexes = inspector.get_indexes("sessions")
         has_user_idx = any(
-            "user_id" in idx.get("column_names", []) for idx in session_indexes
+            idx.get("column_names") == ["user_id"] for idx in session_indexes
         )
         has_expires_idx = any(
-            "expires_at" in idx.get("column_names", []) for idx in session_indexes
+            idx.get("column_names") == ["expires_at"] for idx in session_indexes
         )
 
         # 4. Inspect password_credentials table
@@ -393,9 +427,9 @@ def inspect_legacy_schema(connection: Connection) -> SchemaInspectionResult:
         cred_uqs = inspector.get_unique_constraints("password_credentials")
         cred_idxs = inspector.get_indexes("password_credentials")
         has_unique_user = any(
-            "user_id" in uq.get("column_names", []) for uq in cred_uqs
+            uq.get("column_names") == ["user_id"] for uq in cred_uqs
         ) or any(
-            idx.get("unique") and "user_id" in idx.get("column_names", [])
+            idx.get("unique") and idx.get("column_names") == ["user_id"]
             for idx in cred_idxs
         )
         if not has_unique_user:
@@ -450,6 +484,17 @@ def inspect_legacy_schema(connection: Connection) -> SchemaInspectionResult:
                                 "error": "0004 revision invalid credential_version column"
                             },
                         )
+                    if cred_cols["password_updated_at"][
+                        "nullable"
+                    ] is not False or not _is_datetime_type(
+                        cred_cols["password_updated_at"]["type"]
+                    ):
+                        return SchemaInspectionResult(
+                            state=SchemaState.UNKNOWN,
+                            details={
+                                "error": "0004 revision invalid password_updated_at column"
+                            },
+                        )
                     if not _has_positive_credential_version_check(
                         connection, inspector
                     ):
@@ -459,10 +504,12 @@ def inspect_legacy_schema(connection: Connection) -> SchemaInspectionResult:
                                 "error": "0004 revision missing positive check constraint on credential_version"
                             },
                         )
-                elif current_rev in (
-                    "0002_add_password_updated_at",
-                    "0003_add_session_indexes",
-                ):
+                    if not (has_user_idx and has_expires_idx):
+                        return SchemaInspectionResult(
+                            state=SchemaState.UNKNOWN,
+                            details={"error": "0004 revision missing session indexes"},
+                        )
+                elif current_rev == "0003_add_session_indexes":
                     if (
                         "password_updated_at" not in cred_cols
                         or "credential_version" in cred_cols
@@ -470,6 +517,42 @@ def inspect_legacy_schema(connection: Connection) -> SchemaInspectionResult:
                         return SchemaInspectionResult(
                             state=SchemaState.UNKNOWN,
                             details={"error": f"{current_rev} structural mismatch"},
+                        )
+                    if cred_cols["password_updated_at"][
+                        "nullable"
+                    ] is not False or not _is_datetime_type(
+                        cred_cols["password_updated_at"]["type"]
+                    ):
+                        return SchemaInspectionResult(
+                            state=SchemaState.UNKNOWN,
+                            details={
+                                "error": f"{current_rev} invalid password_updated_at column"
+                            },
+                        )
+                    if not (has_user_idx and has_expires_idx):
+                        return SchemaInspectionResult(
+                            state=SchemaState.UNKNOWN,
+                            details={"error": f"{current_rev} missing session indexes"},
+                        )
+                elif current_rev == "0002_add_password_updated_at":
+                    if (
+                        "password_updated_at" not in cred_cols
+                        or "credential_version" in cred_cols
+                    ):
+                        return SchemaInspectionResult(
+                            state=SchemaState.UNKNOWN,
+                            details={"error": f"{current_rev} structural mismatch"},
+                        )
+                    if cred_cols["password_updated_at"][
+                        "nullable"
+                    ] is not False or not _is_datetime_type(
+                        cred_cols["password_updated_at"]["type"]
+                    ):
+                        return SchemaInspectionResult(
+                            state=SchemaState.UNKNOWN,
+                            details={
+                                "error": f"{current_rev} invalid password_updated_at column"
+                            },
                         )
                 elif current_rev == "0001_initial_schema":
                     if (
@@ -514,6 +597,17 @@ def inspect_legacy_schema(connection: Connection) -> SchemaInspectionResult:
                     details={
                         "table": "password_credentials",
                         "error": "Missing password_updated_at on current schema",
+                    },
+                )
+            pwd_col = cred_cols["password_updated_at"]
+            if pwd_col["nullable"] is not False or not _is_datetime_type(
+                pwd_col["type"]
+            ):
+                return SchemaInspectionResult(
+                    state=SchemaState.UNKNOWN,
+                    details={
+                        "table": "password_credentials",
+                        "error": "Invalid password_updated_at column",
                     },
                 )
             if not _has_positive_credential_version_check(connection, inspector):

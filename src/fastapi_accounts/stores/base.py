@@ -47,6 +47,7 @@ class UserStoreProtocol(Protocol):
         user_id: uuid.UUID,
         raw_token: str,
         max_age_seconds: int = 86400 * 14,
+        expected_credential_version: int | None = None,
         ip_address: str | None = None,
         user_agent: str | None = None,
     ) -> Session: ...

@@ -4,7 +4,7 @@
 
 | Version | Supported          | Security Status                                      |
 | :------ | :----------------- | :--------------------------------------------------- |
-| 0.1.0a5 | :white_check_mark: | Active pre-release with full P0 security hardening   |
+| 0.1.0a5 | :white_check_mark: | Active pre-release with Phase 1 security hardening   |
 | < 0.1.0a5 | :x:              | Deprecated pre-alpha releases with known limitations |
 
 ## Reporting a Vulnerability

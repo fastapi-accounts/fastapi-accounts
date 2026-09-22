@@ -363,21 +363,12 @@ class AccountService:
         """Issue new session record and return (raw_session_token, session_id)."""
         raw_token = generate_secure_token(32)
         try:
-            if expected_credential_version is not None:
-                cred = await self.store.get_password_credential(session, user_id)
-                if (
-                    not cred
-                    or getattr(cred, "credential_version", 1)
-                    != expected_credential_version
-                ):
-                    raise ValueError(
-                        "Credential version mismatch during session creation"
-                    )
             session_rec = await self.store.create_session(
                 session=session,
                 user_id=user_id,
                 raw_token=raw_token,
                 max_age_seconds=max_age_seconds,
+                expected_credential_version=expected_credential_version,
                 ip_address=ip_address,
                 user_agent=user_agent,
             )

@@ -744,48 +744,116 @@ async def test_csrf_cross_type_and_session_ab_isolation(
 
 
 @pytest.mark.asyncio
-async def test_login_reset_in_flight_race(cookie_accounts: FastAPIAccounts):
-    """F3 / P0 #2, P0 #10: Verify in-flight login with old password fails atomically if password reset completes concurrently."""
-    app = FastAPI()
-    app.include_router(cookie_accounts.router, prefix="/api/v1/auth")
-    transport = ASGITransport(app=app)
+async def test_login_reset_in_flight_race():
+    """F1 / P0 #1, P0 #2, P0 #10: Verify in-flight login with old password fails atomically if password reset completes concurrently."""
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = os.path.join(tmp, "race.db")
+        engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
 
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        # 1. Bootstrap CSRF & register user
-        csrf_init = await client.get("/api/v1/auth/csrf")
-        pre_auth_csrf = csrf_init.json()["csrf_token"]
-
-        reg_resp = await client.post(
-            "/api/v1/auth/register",
-            json={"email": "race_user@example.com", "password": "OldPassword123!"},
-            headers={"Origin": "http://test", "X-CSRF-Token": pre_auth_csrf},
+        adapter = SQLAlchemyAdapter(engine=engine)
+        accounts = FastAPIAccounts(
+            adapter=adapter,
+            secret_key="race-secret-test-key-long-enough-32bytes",
+            transport=CookieTransport(cookie_secure=False),
         )
-        assert reg_resp.status_code == 201
+        app = FastAPI()
+        app.include_router(accounts.router, prefix="/api/v1/auth")
+        transport = ASGITransport(app=app)
 
-        # 2. Authenticate user with old password (simulating authentication phase of login)
-        async with cookie_accounts.adapter.session_maker() as db_session:
-            principal, cred_v = await cookie_accounts.service.authenticate_user(
-                db_session, "race_user@example.com", "OldPassword123!"
-            )
-            assert principal is not None
-            assert cred_v == 1
+        async with (
+            AsyncClient(transport=transport, base_url="http://test") as victim,
+            AsyncClient(transport=transport, base_url="http://test") as attacker,
+        ):
 
-            # 3. Simulate concurrent password reset completing while login is in-flight
-            reset_token = cookie_accounts.service.generate_password_reset_token(
-                principal.id, "race_user@example.com", credential_version=1
-            )
-            reset_ok = await cookie_accounts.service.reset_password(
-                db_session, reset_token, "BrandNewPassword456!"
-            )
-            assert reset_ok is True
+            async def get_csrf_headers(client: AsyncClient) -> dict[str, str]:
+                csrf_resp = await client.get("/api/v1/auth/csrf")
+                token = csrf_resp.json()["csrf_token"]
+                return {"Origin": "http://test", "X-CSRF-Token": token}
 
-            # 4. In-flight login attempts to issue session using old cred_v=1 -> rejected!
-            with pytest.raises(ValueError, match="Credential version mismatch"):
-                await cookie_accounts.service.create_session(
-                    session=db_session,
-                    user_id=principal.id,
-                    expected_credential_version=cred_v,
+            # 1. Register victim user
+            victim_pre_headers = await get_csrf_headers(victim)
+            reg_resp = await victim.post(
+                "/api/v1/auth/register",
+                json={"email": "race@example.com", "password": "OldPassword123!"},
+                headers=victim_pre_headers,
+            )
+            assert reg_resp.status_code == 201
+
+            # 2. Generate password reset token
+            async with adapter.session_maker() as db:
+                user = await adapter.get_user_by_email(db, "race@example.com")
+                assert user is not None
+                reset_token = accounts.service.generate_password_reset_token(
+                    user.id, "race@example.com", credential_version=1
                 )
+
+            # 3. Intercept create_session to pause attacker's in-flight login after authentication
+            original_create_session = accounts.adapter.create_session
+            login_paused = asyncio.Event()
+            can_resume_login = asyncio.Event()
+
+            async def paused_create_session(*args, **kwargs):
+                login_paused.set()
+                await can_resume_login.wait()
+                return await original_create_session(*args, **kwargs)
+
+            accounts.adapter.create_session = paused_create_session
+
+            # 4. Attacker initiates login with OldPassword123!
+            attacker_pre_headers = await get_csrf_headers(attacker)
+            attacker_login_task = asyncio.create_task(
+                attacker.post(
+                    "/api/v1/auth/login",
+                    json={"email": "race@example.com", "password": "OldPassword123!"},
+                    headers=attacker_pre_headers,
+                )
+            )
+
+            # 5. Wait until attacker's login is paused inside create_session
+            await asyncio.wait_for(login_paused.wait(), timeout=5.0)
+
+            # 6. Victim resets password while attacker's login is in-flight
+            victim_reset_headers = await get_csrf_headers(victim)
+            reset_resp = await victim.post(
+                "/api/v1/auth/reset-password",
+                json={"token": reset_token, "new_password": "NewPassword456!"},
+                headers=victim_reset_headers,
+            )
+            assert reset_resp.status_code == 200
+
+            # 7. Unpause attacker's create_session -> must fail atomically due to credential_version mismatch
+            can_resume_login.set()
+            attacker_login_resp = await attacker_login_task
+            assert attacker_login_resp.status_code == 401
+
+            # 8. Restore create_session
+            accounts.adapter.create_session = original_create_session
+
+            # 9. Attacker attempt to access /me must fail with 401
+            attacker_me_resp = await attacker.get("/api/v1/auth/me")
+            assert attacker_me_resp.status_code == 401
+
+            # 10. Subsequent login with old password must fail with 401
+            fresh_login_headers = await get_csrf_headers(attacker)
+            fresh_old_login_resp = await attacker.post(
+                "/api/v1/auth/login",
+                json={"email": "race@example.com", "password": "OldPassword123!"},
+                headers=fresh_login_headers,
+            )
+            assert fresh_old_login_resp.status_code == 401
+
+            # 11. Login with new password succeeds
+            fresh_new_headers = await get_csrf_headers(victim)
+            victim_new_login_resp = await victim.post(
+                "/api/v1/auth/login",
+                json={"email": "race@example.com", "password": "NewPassword456!"},
+                headers=fresh_new_headers,
+            )
+            assert victim_new_login_resp.status_code == 200
+
+        await engine.dispose()
 
 
 @pytest.mark.asyncio

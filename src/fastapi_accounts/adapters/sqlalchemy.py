@@ -167,10 +167,32 @@ class SQLAlchemyAdapter:
         user_id: uuid.UUID,
         raw_token: str,
         max_age_seconds: int = 86400 * 14,
+        expected_credential_version: int | None = None,
         ip_address: str | None = None,
         user_agent: str | None = None,
     ) -> Session:
         """Create a new active session record storing hashed token."""
+        if expected_credential_version is not None:
+            if (
+                type(expected_credential_version) is not int
+                or expected_credential_version < 1
+            ):
+                raise ValueError("Invalid expected_credential_version")
+            stmt = select(self.credential_model).where(
+                self.credential_model.user_id == user_id,
+                self.credential_model.credential_version == expected_credential_version,
+            )
+            bind = session.bind or getattr(self, "engine", None)
+            if (
+                bind
+                and getattr(bind, "dialect", None)
+                and bind.dialect.name != "sqlite"
+            ):
+                stmt = stmt.with_for_update()
+            cred = (await session.execute(stmt)).scalars().first()
+            if not cred:
+                raise ValueError("Credential version mismatch during session creation")
+
         token_id = hash_token(raw_token)
         expires_at = utc_now() + timedelta(seconds=max_age_seconds)
 

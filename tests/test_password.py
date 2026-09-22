@@ -66,10 +66,14 @@ async def test_event_loop_not_blocked_during_hashing(monkeypatch):
     svc = PasswordService(argon2_concurrency=4)
 
     # 1. Deterministic thread-offload verification: intercept synchronous hash_password with threading.Event
+    main_thread_id = threading.get_ident()
+    worker_thread_id = None
     worker_started = threading.Event()
     worker_can_finish = threading.Event()
 
     def blocking_hash(secret: str) -> str:
+        nonlocal worker_thread_id
+        worker_thread_id = threading.get_ident()
         worker_started.set()
         worker_can_finish.wait(timeout=5.0)
         return "$argon2id$mock_blocked_hash"
@@ -81,6 +85,15 @@ async def test_event_loop_not_blocked_during_hashing(monkeypatch):
     while not worker_started.is_set():
         await asyncio.sleep(0.001)
 
+    # Assert task is running on a worker thread and still pending while blocked
+    assert not task.done(), (
+        "Task completed prematurely while worker thread is still held"
+    )
+    assert worker_thread_id is not None
+    assert worker_thread_id != main_thread_id, (
+        "Hash operation did not execute on a separate worker thread"
+    )
+
     # Event loop continues processing while offloaded worker thread is blocked
     loop_progressed = False
     for _ in range(5):
@@ -88,6 +101,7 @@ async def test_event_loop_not_blocked_during_hashing(monkeypatch):
         loop_progressed = True
 
     assert loop_progressed is True
+    assert not task.done(), "Task finished before worker_can_finish was released"
     worker_can_finish.set()
 
     res = await task
@@ -97,21 +111,25 @@ async def test_event_loop_not_blocked_during_hashing(monkeypatch):
     monkeypatch.undo()
 
     # 2. Live Argon2 hashing heartbeat concurrency
-    ticks = 0
+    ticks_during = 0
+    stop_heartbeat = asyncio.Event()
 
     async def heartbeat():
-        nonlocal ticks
-        for _ in range(10):
-            await asyncio.sleep(0.01)
-            ticks += 1
+        nonlocal ticks_during
+        while not stop_heartbeat.is_set():
+            ticks_during += 1
+            await asyncio.sleep(0.005)
 
     heartbeat_task = asyncio.create_task(heartbeat())
+    await asyncio.sleep(0.01)
+
     hashes = await asyncio.gather(
         svc.async_hash_password("Pass1234!"),
         svc.async_hash_password("Pass5678!"),
         svc.async_hash_password("Pass9012!"),
     )
+    stop_heartbeat.set()
     await heartbeat_task
 
     assert len(hashes) == 3
-    assert ticks > 0
+    assert ticks_during > 0, "Heartbeat failed to tick during concurrent hashing"

@@ -22,7 +22,7 @@ Today, building authentication in FastAPI usually means either:
 2. **Wrestling with complex generic typing and multi-file wiring** in older libraries that are now in maintenance mode.
 3. **Paying steep monthly fees** to vendor-locked cloud auth providers (Clerk, Auth0).
 
-**FastAPI Accounts** provides a modular, production-hardened authentication and account management engine built for **FastAPI**, **Pydantic v2**, and **Async SQLAlchemy 2.0**.
+**FastAPI Accounts** provides a modular, security-focused authentication and account management engine built for **FastAPI**, **Pydantic v2**, and **Async SQLAlchemy 2.0**.
 
 📖 *Read our full story: [**The Journey of FastAPI Accounts (JOURNEY.md)**](JOURNEY.md).*
 

@@ -427,51 +427,76 @@ def test_inspect_legacy_schema_outcomes():
             conn.commit()
             assert inspect_legacy_schema(conn).state == SchemaState.UNKNOWN
 
-        # 7. Check constraint with non-positive predicate (e.g. <= 0) -> UNKNOWN
-        with engine.connect() as conn:
-            conn.execute(text("DROP TABLE IF EXISTS alembic_version"))
-            conn.execute(text("DROP TABLE users"))
-            conn.execute(text("DROP TABLE email_addresses"))
-            conn.execute(text("DROP TABLE password_credentials"))
-            conn.execute(text("DROP TABLE sessions"))
-            conn.execute(
-                text(
-                    "CREATE TABLE users (id CHAR(36) PRIMARY KEY, is_active BOOLEAN NOT NULL DEFAULT 1, is_superuser BOOLEAN NOT NULL DEFAULT 0, created_at TIMESTAMP NOT NULL, updated_at TIMESTAMP NOT NULL)"
-                )
-            )
-            conn.execute(
-                text(
-                    "CREATE TABLE email_addresses (id CHAR(36) PRIMARY KEY, user_id CHAR(36) NOT NULL REFERENCES users(id), email VARCHAR(320) NOT NULL UNIQUE, is_verified BOOLEAN NOT NULL DEFAULT 0, is_primary BOOLEAN NOT NULL DEFAULT 0, created_at TIMESTAMP NOT NULL)"
-                )
-            )
-            conn.execute(
-                text(
-                    "CREATE TABLE sessions (id VARCHAR(64) PRIMARY KEY, user_id CHAR(36) NOT NULL REFERENCES users(id), created_at TIMESTAMP NOT NULL, expires_at TIMESTAMP NOT NULL, ip_address VARCHAR(45), user_agent VARCHAR(512))"
-                )
-            )
-            conn.execute(text("CREATE INDEX ix_sessions_user_id ON sessions(user_id)"))
-            conn.execute(
-                text("CREATE INDEX ix_sessions_expires_at ON sessions(expires_at)")
-            )
-            # password_credentials with bad check constraint <= 0
-            conn.execute(
-                text(
-                    "CREATE TABLE password_credentials (id CHAR(36) PRIMARY KEY, user_id CHAR(36) NOT NULL UNIQUE REFERENCES users(id), hashed_password VARCHAR(1024) NOT NULL, password_updated_at TIMESTAMP NOT NULL, credential_version INTEGER NOT NULL DEFAULT 1, created_at TIMESTAMP NOT NULL, updated_at TIMESTAMP NOT NULL, CONSTRAINT ck_bad CHECK (credential_version <= 0))"
-                )
-            )
-            conn.commit()
-            assert inspect_legacy_schema(conn).state == SchemaState.UNKNOWN
+        # Helper to build canonical metadata clone
+        def clone_metadata() -> sa.MetaData:
+            m = sa.MetaData()
+            for table in Base.metadata.sorted_tables:
+                table.to_metadata(m)
+            return m
 
-        # 8. NUMERIC column type for credential_version -> UNKNOWN
-        with engine.connect() as conn:
-            conn.execute(text("DROP TABLE password_credentials"))
-            conn.execute(
-                text(
-                    "CREATE TABLE password_credentials (id CHAR(36) PRIMARY KEY, user_id CHAR(36) NOT NULL UNIQUE REFERENCES users(id), hashed_password VARCHAR(1024) NOT NULL, password_updated_at TIMESTAMP NOT NULL, credential_version NUMERIC(10, 0) NOT NULL DEFAULT 1, created_at TIMESTAMP NOT NULL, updated_at TIMESTAMP NOT NULL, CONSTRAINT ck_password_credentials_credential_version_positive CHECK (credential_version >= 1))"
-                )
+        def set_check_constraint(table: sa.Table, expr: str, name: str) -> None:
+            table.c.credential_version.constraints.clear()
+            for c in list(table.constraints):
+                if isinstance(c, sa.CheckConstraint):
+                    table.constraints.remove(c)
+            table.append_constraint(sa.CheckConstraint(expr, name=name))
+
+        # 7. Check constraint with non-positive predicate (<= 0) -> UNKNOWN
+        with tempfile.TemporaryDirectory() as td:
+            eng = create_engine(f"sqlite:///{td}/bad_ck.db")
+            meta_bad_ck = clone_metadata()
+            set_check_constraint(
+                meta_bad_ck.tables["password_credentials"],
+                "credential_version <= 0",
+                "ck_bad",
             )
-            conn.commit()
-            assert inspect_legacy_schema(conn).state == SchemaState.UNKNOWN
+            meta_bad_ck.create_all(eng)
+            with eng.connect() as conn:
+                assert inspect_legacy_schema(conn).state == SchemaState.UNKNOWN
+            eng.dispose()
+
+        # 8. Check constraint with tautology (1=1) -> UNKNOWN
+        with tempfile.TemporaryDirectory() as td:
+            eng = create_engine(f"sqlite:///{td}/tautology_ck.db")
+            meta_tautology = clone_metadata()
+            set_check_constraint(
+                meta_tautology.tables["password_credentials"],
+                "1=1",
+                "ck_password_credentials_credential_version_positive",
+            )
+            meta_tautology.create_all(eng)
+            with eng.connect() as conn:
+                assert inspect_legacy_schema(conn).state == SchemaState.UNKNOWN
+            eng.dispose()
+
+        # 9. NUMERIC column type for credential_version -> UNKNOWN
+        with tempfile.TemporaryDirectory() as td:
+            eng = create_engine(f"sqlite:///{td}/numeric.db")
+            meta_num = clone_metadata()
+            meta_num.tables[
+                "password_credentials"
+            ].c.credential_version.type = sa.Numeric()
+            meta_num.create_all(eng)
+            with eng.connect() as conn:
+                assert inspect_legacy_schema(conn).state == SchemaState.UNKNOWN
+            eng.dispose()
+
+        # 10. Composite uniqueness on email -> UNKNOWN
+        with tempfile.TemporaryDirectory() as td:
+            eng = create_engine(f"sqlite:///{td}/composite_email.db")
+            meta_comp_email = clone_metadata()
+            tbl = meta_comp_email.tables["email_addresses"]
+            for idx in list(tbl.indexes):
+                if idx.unique:
+                    tbl.indexes.remove(idx)
+            for c in list(tbl.constraints):
+                if isinstance(c, sa.UniqueConstraint):
+                    tbl.constraints.remove(c)
+            sa.Index("ix_comp_email", tbl.c.email, tbl.c.user_id, unique=True)
+            meta_comp_email.create_all(eng)
+            with eng.connect() as conn:
+                assert inspect_legacy_schema(conn).state == SchemaState.UNKNOWN
+            eng.dispose()
 
 
 def test_get_alembic_config_helper_percent_escaping():
