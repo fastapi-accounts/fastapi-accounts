@@ -280,10 +280,102 @@ async def test_migration_adopt_unversioned_current_schema():
         with sync_engine.connect() as conn:
             res = inspect_legacy_schema(conn)
             assert res.state == SchemaState.UNVERSIONED_CURRENT
-            assert res.stamp_revision == "0004_add_credential_version"
+            assert res.stamp_revision == "0005_add_session_credential_version"
 
         alembic_cfg = get_alembic_config(sync_db_url)
         command.stamp(alembic_cfg, res.stamp_revision)
+        command.upgrade(alembic_cfg, "head")
+        command.check(alembic_cfg)
+
+
+@pytest.mark.asyncio
+async def test_migration_adopt_legacy_a4_schema():
+    """Test adopting authentic v0.1.0a4 schema (with password_credentials.credential_version but no sessions.credential_version)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = os.path.join(tmpdir, "legacy_a4_test.db")
+        sync_db_url = f"sqlite:///{db_path}"
+        sync_engine = create_engine(sync_db_url)
+
+        alembic_cfg = get_alembic_config(sync_db_url)
+        command.upgrade(alembic_cfg, "0004_add_credential_version")
+
+        # Now drop alembic_version table to simulate unmanaged a4 database
+        with sync_engine.connect() as conn:
+            conn.execute(text("DROP TABLE alembic_version"))
+            conn.commit()
+
+            res = inspect_legacy_schema(conn)
+            assert res.state == SchemaState.UNVERSIONED_A4
+            assert res.stamp_revision == "0004_add_credential_version"
+
+        command.stamp(alembic_cfg, res.stamp_revision)
+        command.upgrade(alembic_cfg, "head")
+        command.check(alembic_cfg)
+
+
+@pytest.mark.asyncio
+async def test_migration_0005_backfill_and_reversibility():
+    """Test upgrading 0004 -> 0005 backfills session credential_version and downgrades cleanly."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = os.path.join(tmpdir, "backfill_0005.db")
+        sync_db_url = f"sqlite:///{db_path}"
+        engine = create_engine(sync_db_url)
+
+        alembic_cfg = get_alembic_config(sync_db_url)
+        command.upgrade(alembic_cfg, "0004_add_credential_version")
+
+        user1_id = uuid.uuid4()
+        user2_id = uuid.uuid4()
+        now = datetime.now(timezone.utc)
+
+        with engine.connect() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO users (id, is_active, is_superuser, created_at, updated_at) "
+                    "VALUES (:u1, 1, 0, :now, :now), (:u2, 1, 0, :now, :now)"
+                ),
+                {"u1": str(user1_id), "u2": str(user2_id), "now": now},
+            )
+            # user 1 has credential_version = 3
+            conn.execute(
+                text(
+                    "INSERT INTO password_credentials (id, user_id, hashed_password, credential_version, password_updated_at, created_at, updated_at) "
+                    "VALUES (:cid, :u1, 'hash', 3, :now, :now, :now)"
+                ),
+                {"cid": str(uuid.uuid4()), "u1": str(user1_id), "now": now},
+            )
+            # user 2 has no password credentials (e.g. OAuth user)
+            # Insert sessions for both
+            conn.execute(
+                text(
+                    "INSERT INTO sessions (id, user_id, created_at, expires_at) "
+                    "VALUES ('sess1', :u1, :now, :now), ('sess2', :u2, :now, :now)"
+                ),
+                {"u1": str(user1_id), "u2": str(user2_id), "now": now},
+            )
+            conn.commit()
+
+        # Upgrade to 0005
+        command.upgrade(alembic_cfg, "0005_add_session_credential_version")
+        command.check(alembic_cfg)
+
+        with engine.connect() as conn:
+            sess1_v = conn.execute(
+                text("SELECT credential_version FROM sessions WHERE id = 'sess1'")
+            ).scalar()
+            sess2_v = conn.execute(
+                text("SELECT credential_version FROM sessions WHERE id = 'sess2'")
+            ).scalar()
+            assert sess1_v == 3
+            assert sess2_v == 1
+
+        # Test downgrade to 0004
+        command.downgrade(alembic_cfg, "0004_add_credential_version")
+        with engine.connect() as conn:
+            cols = {c["name"] for c in sa.inspect(conn).get_columns("sessions")}
+            assert "credential_version" not in cols
+
+        # Re-upgrade to head
         command.upgrade(alembic_cfg, "head")
         command.check(alembic_cfg)
 
@@ -412,7 +504,7 @@ def test_inspect_legacy_schema_outcomes():
             conn.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32))"))
             conn.execute(
                 text(
-                    "INSERT INTO alembic_version VALUES ('0004_add_credential_version')"
+                    "INSERT INTO alembic_version VALUES ('0005_add_session_credential_version')"
                 )
             )
             conn.execute(text("DROP TABLE users"))
@@ -440,6 +532,16 @@ def test_inspect_legacy_schema_outcomes():
                 if isinstance(c, sa.CheckConstraint):
                     table.constraints.remove(c)
             table.append_constraint(sa.CheckConstraint(expr, name=name))
+
+        def replace_fk(table: sa.Table, target_table: str, target_column: str) -> None:
+            for constraint in list(table.constraints):
+                if isinstance(constraint, sa.ForeignKeyConstraint):
+                    table.constraints.remove(constraint)
+            table.append_constraint(
+                sa.ForeignKeyConstraint(
+                    ["user_id"], [f"{target_table}.{target_column}"]
+                )
+            )
 
         # 7. Check constraint with non-positive predicate (<= 0) -> UNKNOWN
         with tempfile.TemporaryDirectory() as td:
@@ -498,6 +600,105 @@ def test_inspect_legacy_schema_outcomes():
                 assert inspect_legacy_schema(conn).state == SchemaState.UNKNOWN
             eng.dispose()
 
+        # 11-14. TIME types instead of TIMESTAMP/DATETIME -> UNKNOWN
+        time_variants = [
+            (
+                "password_updated_at_TIME",
+                lambda m: setattr(
+                    m.tables["password_credentials"].c.password_updated_at,
+                    "type",
+                    sa.Time(),
+                ),
+            ),
+            (
+                "user_created_at_TIME",
+                lambda m: setattr(m.tables["users"].c.created_at, "type", sa.Time()),
+            ),
+            (
+                "email_created_at_TIME",
+                lambda m: setattr(
+                    m.tables["email_addresses"].c.created_at, "type", sa.Time()
+                ),
+            ),
+            (
+                "session_expires_at_TIME",
+                lambda m: setattr(m.tables["sessions"].c.expires_at, "type", sa.Time()),
+            ),
+        ]
+        for name, mut in time_variants:
+            with tempfile.TemporaryDirectory() as td:
+                eng = create_engine(f"sqlite:///{td}/time_{name}.db")
+                m = clone_metadata()
+                mut(m)
+                m.create_all(eng)
+                with eng.connect() as conn:
+                    assert inspect_legacy_schema(conn).state == SchemaState.UNKNOWN, (
+                        f"Failed for {name}"
+                    )
+                eng.dispose()
+
+        # 15-18. Short string types (String(1)) instead of UUID/ID/Email/Hash -> UNKNOWN
+        short_str_variants = [
+            (
+                "user_id_short_string",
+                lambda m: setattr(m.tables["users"].c.id, "type", sa.String(1)),
+            ),
+            (
+                "email_id_short_string",
+                lambda m: setattr(
+                    m.tables["email_addresses"].c.id, "type", sa.String(1)
+                ),
+            ),
+            (
+                "email_short_string",
+                lambda m: setattr(
+                    m.tables["email_addresses"].c.email, "type", sa.String(1)
+                ),
+            ),
+            (
+                "password_hash_short_string",
+                lambda m: setattr(
+                    m.tables["password_credentials"].c.hashed_password,
+                    "type",
+                    sa.String(1),
+                ),
+            ),
+        ]
+        for name, mut in short_str_variants:
+            with tempfile.TemporaryDirectory() as td:
+                eng = create_engine(f"sqlite:///{td}/str_{name}.db")
+                m = clone_metadata()
+                mut(m)
+                m.create_all(eng)
+                with eng.connect() as conn:
+                    assert inspect_legacy_schema(conn).state == SchemaState.UNKNOWN, (
+                        f"Failed for {name}"
+                    )
+                eng.dispose()
+
+        # 19-20. Wrong Foreign Key Target (pointing to users.is_active instead of users.id) -> UNKNOWN
+        fk_variants = [
+            (
+                "email_fk_wrong_target",
+                lambda m: replace_fk(m.tables["email_addresses"], "users", "is_active"),
+            ),
+            (
+                "session_fk_wrong_target",
+                lambda m: replace_fk(m.tables["sessions"], "users", "is_active"),
+            ),
+        ]
+        for name, mut in fk_variants:
+            with tempfile.TemporaryDirectory() as td:
+                eng = create_engine(f"sqlite:///{td}/fk_{name}.db")
+                m = clone_metadata()
+                mut(m)
+                m.create_all(eng)
+                with eng.connect() as conn:
+                    assert inspect_legacy_schema(conn).state == SchemaState.UNKNOWN, (
+                        f"Failed for {name}"
+                    )
+                eng.dispose()
+
 
 def test_get_alembic_config_helper_percent_escaping():
     test_url = "postgresql+asyncpg://user:p%25ss@localhost:5432/test_db%25"
@@ -536,5 +737,30 @@ def test_migration_0004_rejects_pre_existing_drift():
             conn.commit()
 
         # Upgrading to head (0004) must fail closed with RuntimeError
+        with pytest.raises(RuntimeError, match="Schema drift detected"):
+            command.upgrade(alembic_cfg, "head")
+
+
+def test_migration_0005_rejects_pre_existing_drift():
+    """Verify that upgrading a managed database from 0004 to 0005 fails closed if sessions.credential_version column already exists."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = os.path.join(tmpdir, "drift_0005_test.db")
+        sync_db_url = f"sqlite:///{db_path}"
+        alembic_cfg = get_alembic_config(sync_db_url)
+
+        # Upgrade to 0004
+        command.upgrade(alembic_cfg, "0004_add_credential_version")
+
+        # Manually add credential_version column on sessions out-of-band
+        engine = create_engine(sync_db_url)
+        with engine.connect() as conn:
+            conn.execute(
+                text(
+                    "ALTER TABLE sessions ADD COLUMN credential_version INTEGER DEFAULT 1"
+                )
+            )
+            conn.commit()
+
+        # Upgrading to head (0005) must fail closed with RuntimeError
         with pytest.raises(RuntimeError, match="Schema drift detected"):
             command.upgrade(alembic_cfg, "head")

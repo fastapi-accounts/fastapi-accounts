@@ -25,10 +25,12 @@ Please do not open public GitHub issues or discussions for undisclosed vulnerabi
 
 `fastapi-accounts` is engineered around strict security invariants:
 
-1. **Replay-Immune Monotonic Credential Versioning (P0 #2):**
+1. **Replay-Immune Monotonic Credential Versioning & Generation-Bound Sessions (P0 #2, P0 #13):**
    - Password state is tracked via a monotonically increasing `credential_version: int` column in the database with a database check constraint (`credential_version >= 1`).
    - Reset tokens embed `token_v: 2` and `cred_v: int`.
    - All password mutations execute an atomic SQL Compare-And-Swap (CAS) `WHERE credential_version = expected_cred_v` setting `credential_version = credential_version + 1`.
+   - Sessions store their verified `credential_version: int` (check constraint `credential_version >= 1`).
+   - Authentication queries require `sessions.credential_version == password_credentials.credential_version`. Any password change or reset invalidates stale in-flight or existing sessions immediately.
    - Replay is impossible even under frozen, backwards, or skewed system clocks.
 
 2. **Off-Loop Bounded Password Hashing & Timing Oracle Equalization (P0 #9):**

@@ -296,6 +296,7 @@ class AccountService:
         new_hash = await self.password_service.async_hash_password(new_password)
 
         try:
+            new_version = cred.credential_version + 1
             success = await self.store.update_password_if_version(
                 session=session,
                 user_id=user_id,
@@ -306,10 +307,32 @@ class AccountService:
                 await session.rollback()
                 return False
 
-            if revoke_other_sessions and current_raw_token:
-                await self.store.revoke_other_user_sessions(
-                    session, user_id, current_raw_token
+            if current_raw_token:
+                # Update current session generation
+                updated = await self.store.update_session_credential_version(
+                    session, current_raw_token, new_version
                 )
+                if not updated:
+                    await session.rollback()
+                    return False
+                if revoke_other_sessions:
+                    # Revoke other sessions
+                    await self.store.revoke_other_user_sessions(
+                        session, user_id, current_raw_token
+                    )
+                else:
+                    # Keep other sessions alive by updating their credential generation to new_version
+                    await self.store.update_all_user_sessions_credential_version(
+                        session, user_id, new_version
+                    )
+            else:
+                if revoke_other_sessions:
+                    # Programmatic password change without session token context: revoke all
+                    await self.store.revoke_all_user_sessions(session, user_id)
+                else:
+                    await self.store.update_all_user_sessions_credential_version(
+                        session, user_id, new_version
+                    )
 
             await session.commit()
             return True

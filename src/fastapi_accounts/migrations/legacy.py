@@ -22,12 +22,14 @@ KNOWN_REVISIONS = {
     "0002_add_password_updated_at",
     "0003_add_session_indexes",
     "0004_add_credential_version",
+    "0005_add_session_credential_version",
 }
 
 
 class SchemaState(str, Enum):
     UNVERSIONED_A2 = "unversioned_a2"
     UNVERSIONED_A3 = "unversioned_a3"
+    UNVERSIONED_A4 = "unversioned_a4"
     UNVERSIONED_CURRENT = "unversioned_current"
     ALEMBIC_MANAGED = "alembic_managed"
     UNKNOWN = "unknown"
@@ -48,12 +50,25 @@ def _is_bool_type(col_type: Any) -> bool:
 
 def _is_datetime_type(col_type: Any) -> bool:
     t = str(col_type).upper()
-    return "TIMESTAMP" in t or "DATETIME" in t or "TIME" in t
+    if t.startswith("TIME") and not t.startswith("TIMESTAMP"):
+        return False
+    return "TIMESTAMP" in t or "DATETIME" in t
 
 
-def _is_string_type(col_type: Any) -> bool:
+def _is_string_type(col_type: Any, min_length: int | None = None) -> bool:
     t = str(col_type).upper()
-    return any(k in t for k in ("CHAR", "VARCHAR", "STRING", "TEXT", "UUID"))
+    if not any(k in t for k in ("CHAR", "VARCHAR", "STRING", "TEXT", "UUID")):
+        return False
+    if min_length is not None:
+        length = getattr(col_type, "length", None)
+        if length is not None and length < min_length:
+            return False
+        m = re.search(r"\((\d+)\)", t)
+        if m:
+            val = int(m.group(1))
+            if val < min_length:
+                return False
+    return True
 
 
 def _is_int_type(col_type: Any) -> bool:
@@ -119,11 +134,11 @@ def _extract_sqlite_check_predicates(table_sql: str) -> list[str]:
 
 
 def _has_positive_credential_version_check(
-    connection: Connection, inspector: Any
+    connection: Connection, inspector: Any, table_name: str = "password_credentials"
 ) -> bool:
     # 1. Try inspector get_check_constraints
     try:
-        cks = inspector.get_check_constraints("password_credentials")
+        cks = inspector.get_check_constraints(table_name)
         for ck in cks or []:
             sqltext = str(ck.get("sqltext") or "").strip()
             if sqltext and _is_valid_positive_cred_v_predicate(sqltext):
@@ -136,7 +151,7 @@ def _has_positive_credential_version_check(
         if connection.dialect.name == "sqlite":
             res = connection.execute(
                 sa.text(
-                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='password_credentials'"
+                    f"SELECT sql FROM sqlite_master WHERE type='table' AND name='{table_name}'"
                 )
             ).scalar()
             if res:
@@ -149,12 +164,23 @@ def _has_positive_credential_version_check(
     return False
 
 
+def _has_fk_to_users_id(fks: Any, local_col: str = "user_id") -> bool:
+    for fk in fks or []:
+        if (
+            fk.get("referred_table") == "users"
+            and list(fk.get("constrained_columns") or []) == [local_col]
+            and list(fk.get("referred_columns") or []) == ["id"]
+        ):
+            return True
+    return False
+
+
 def inspect_legacy_schema(connection: Connection) -> SchemaInspectionResult:
     """Inspect an existing database schema and classify it strictly.
 
     Returns:
         SchemaInspectionResult with state in SchemaState (UNVERSIONED_A2, UNVERSIONED_A3,
-        UNVERSIONED_CURRENT, ALEMBIC_MANAGED, UNKNOWN) and recommended stamp_revision.
+        UNVERSIONED_A4, UNVERSIONED_CURRENT, ALEMBIC_MANAGED, UNKNOWN) and recommended stamp_revision.
     """
     try:
         inspector = sa.inspect(connection)
@@ -189,7 +215,7 @@ def inspect_legacy_schema(connection: Connection) -> SchemaInspectionResult:
                         "error": f"Column {col_name} is nullable",
                     },
                 )
-        if not _is_string_type(user_cols["id"]["type"]):
+        if not _is_string_type(user_cols["id"]["type"], min_length=32):
             return SchemaInspectionResult(
                 state=SchemaState.UNKNOWN,
                 details={"table": "users", "error": "Invalid id type"},
@@ -240,9 +266,9 @@ def inspect_legacy_schema(connection: Connection) -> SchemaInspectionResult:
                     },
                 )
         if (
-            not _is_string_type(email_cols["id"]["type"])
-            or not _is_string_type(email_cols["user_id"]["type"])
-            or not _is_string_type(email_cols["email"]["type"])
+            not _is_string_type(email_cols["id"]["type"], min_length=32)
+            or not _is_string_type(email_cols["user_id"]["type"], min_length=32)
+            or not _is_string_type(email_cols["email"]["type"], min_length=32)
         ):
             return SchemaInspectionResult(
                 state=SchemaState.UNKNOWN,
@@ -270,16 +296,12 @@ def inspect_legacy_schema(connection: Connection) -> SchemaInspectionResult:
                 details={"table": "email_addresses", "error": "Missing primary key"},
             )
         email_fks = inspector.get_foreign_keys("email_addresses")
-        if not any(
-            fk.get("referred_table") == "users"
-            and "user_id" in fk.get("constrained_columns", [])
-            for fk in email_fks
-        ):
+        if not _has_fk_to_users_id(email_fks, "user_id"):
             return SchemaInspectionResult(
                 state=SchemaState.UNKNOWN,
                 details={
                     "table": "email_addresses",
-                    "error": "Missing foreign key to users",
+                    "error": "Missing foreign key to users.id",
                 },
             )
         email_uqs = inspector.get_unique_constraints("email_addresses")
@@ -323,9 +345,9 @@ def inspect_legacy_schema(connection: Connection) -> SchemaInspectionResult:
                         "error": f"Column {col_name} is nullable",
                     },
                 )
-        if not _is_string_type(session_cols["id"]["type"]) or not _is_string_type(
-            session_cols["user_id"]["type"]
-        ):
+        if not _is_string_type(
+            session_cols["id"]["type"], min_length=32
+        ) or not _is_string_type(session_cols["user_id"]["type"], min_length=32):
             return SchemaInspectionResult(
                 state=SchemaState.UNKNOWN,
                 details={"table": "sessions", "error": "Invalid string column types"},
@@ -344,14 +366,13 @@ def inspect_legacy_schema(connection: Connection) -> SchemaInspectionResult:
                 details={"table": "sessions", "error": "Missing primary key"},
             )
         session_fks = inspector.get_foreign_keys("sessions")
-        if not any(
-            fk.get("referred_table") == "users"
-            and "user_id" in fk.get("constrained_columns", [])
-            for fk in session_fks
-        ):
+        if not _has_fk_to_users_id(session_fks, "user_id"):
             return SchemaInspectionResult(
                 state=SchemaState.UNKNOWN,
-                details={"table": "sessions", "error": "Missing foreign key to users"},
+                details={
+                    "table": "sessions",
+                    "error": "Missing foreign key to users.id",
+                },
             )
         session_indexes = inspector.get_indexes("sessions")
         has_user_idx = any(
@@ -381,9 +402,9 @@ def inspect_legacy_schema(connection: Connection) -> SchemaInspectionResult:
                     },
                 )
         if (
-            not _is_string_type(cred_cols["id"]["type"])
-            or not _is_string_type(cred_cols["user_id"]["type"])
-            or not _is_string_type(cred_cols["hashed_password"]["type"])
+            not _is_string_type(cred_cols["id"]["type"], min_length=32)
+            or not _is_string_type(cred_cols["user_id"]["type"], min_length=32)
+            or not _is_string_type(cred_cols["hashed_password"]["type"], min_length=32)
         ):
             return SchemaInspectionResult(
                 state=SchemaState.UNKNOWN,
@@ -412,16 +433,12 @@ def inspect_legacy_schema(connection: Connection) -> SchemaInspectionResult:
                 },
             )
         cred_fks = inspector.get_foreign_keys("password_credentials")
-        if not any(
-            fk.get("referred_table") == "users"
-            and "user_id" in fk.get("constrained_columns", [])
-            for fk in cred_fks
-        ):
+        if not _has_fk_to_users_id(cred_fks, "user_id"):
             return SchemaInspectionResult(
                 state=SchemaState.UNKNOWN,
                 details={
                     "table": "password_credentials",
-                    "error": "Missing foreign key to users",
+                    "error": "Missing foreign key to users.id",
                 },
             )
         cred_uqs = inspector.get_unique_constraints("password_credentials")
@@ -462,16 +479,83 @@ def inspect_legacy_schema(connection: Connection) -> SchemaInspectionResult:
                         details={"error": f"Unknown alembic revision: {current_rev}"},
                     )
                 # Verify structural fingerprint matches the claimed revision
-                if current_rev == "0004_add_credential_version":
+                if current_rev == "0005_add_session_credential_version":
                     if (
                         "credential_version" not in cred_cols
                         or "password_updated_at" not in cred_cols
+                        or "credential_version" not in session_cols
                     ):
                         return SchemaInspectionResult(
                             state=SchemaState.UNKNOWN,
                             details={
-                                "error": "0004 revision missing credential_version or password_updated_at"
+                                "error": "0005 revision missing credential_version or password_updated_at columns"
                             },
+                        )
+                    if cred_cols["credential_version"][
+                        "nullable"
+                    ] is not False or not _is_int_type(
+                        cred_cols["credential_version"]["type"]
+                    ):
+                        return SchemaInspectionResult(
+                            state=SchemaState.UNKNOWN,
+                            details={
+                                "error": "0005 revision invalid password_credentials.credential_version column"
+                            },
+                        )
+                    if cred_cols["password_updated_at"][
+                        "nullable"
+                    ] is not False or not _is_datetime_type(
+                        cred_cols["password_updated_at"]["type"]
+                    ):
+                        return SchemaInspectionResult(
+                            state=SchemaState.UNKNOWN,
+                            details={
+                                "error": "0005 revision invalid password_updated_at column"
+                            },
+                        )
+                    if not _has_positive_credential_version_check(
+                        connection, inspector, "password_credentials"
+                    ):
+                        return SchemaInspectionResult(
+                            state=SchemaState.UNKNOWN,
+                            details={
+                                "error": "0005 revision missing positive check constraint on password_credentials.credential_version"
+                            },
+                        )
+                    if session_cols["credential_version"][
+                        "nullable"
+                    ] is not False or not _is_int_type(
+                        session_cols["credential_version"]["type"]
+                    ):
+                        return SchemaInspectionResult(
+                            state=SchemaState.UNKNOWN,
+                            details={
+                                "error": "0005 revision invalid sessions.credential_version column"
+                            },
+                        )
+                    if not _has_positive_credential_version_check(
+                        connection, inspector, "sessions"
+                    ):
+                        return SchemaInspectionResult(
+                            state=SchemaState.UNKNOWN,
+                            details={
+                                "error": "0005 revision missing positive check constraint on sessions.credential_version"
+                            },
+                        )
+                    if not (has_user_idx and has_expires_idx):
+                        return SchemaInspectionResult(
+                            state=SchemaState.UNKNOWN,
+                            details={"error": "0005 revision missing session indexes"},
+                        )
+                elif current_rev == "0004_add_credential_version":
+                    if (
+                        "credential_version" not in cred_cols
+                        or "password_updated_at" not in cred_cols
+                        or "credential_version" in session_cols
+                    ):
+                        return SchemaInspectionResult(
+                            state=SchemaState.UNKNOWN,
+                            details={"error": "0004 revision structural mismatch"},
                         )
                     if cred_cols["credential_version"][
                         "nullable"
@@ -496,7 +580,7 @@ def inspect_legacy_schema(connection: Connection) -> SchemaInspectionResult:
                             },
                         )
                     if not _has_positive_credential_version_check(
-                        connection, inspector
+                        connection, inspector, "password_credentials"
                     ):
                         return SchemaInspectionResult(
                             state=SchemaState.UNKNOWN,
@@ -513,6 +597,7 @@ def inspect_legacy_schema(connection: Connection) -> SchemaInspectionResult:
                     if (
                         "password_updated_at" not in cred_cols
                         or "credential_version" in cred_cols
+                        or "credential_version" in session_cols
                     ):
                         return SchemaInspectionResult(
                             state=SchemaState.UNKNOWN,
@@ -538,6 +623,7 @@ def inspect_legacy_schema(connection: Connection) -> SchemaInspectionResult:
                     if (
                         "password_updated_at" not in cred_cols
                         or "credential_version" in cred_cols
+                        or "credential_version" in session_cols
                     ):
                         return SchemaInspectionResult(
                             state=SchemaState.UNKNOWN,
@@ -558,6 +644,7 @@ def inspect_legacy_schema(connection: Connection) -> SchemaInspectionResult:
                     if (
                         "password_updated_at" in cred_cols
                         or "credential_version" in cred_cols
+                        or "credential_version" in session_cols
                     ):
                         return SchemaInspectionResult(
                             state=SchemaState.UNKNOWN,
@@ -579,7 +666,7 @@ def inspect_legacy_schema(connection: Connection) -> SchemaInspectionResult:
                 )
 
         # 6. Unmanaged database classification
-        if "credential_version" in cred_cols:
+        if "credential_version" in session_cols and "credential_version" in cred_cols:
             cred_v_col = cred_cols["credential_version"]
             if cred_v_col["nullable"] is not False or not _is_int_type(
                 cred_v_col["type"]
@@ -610,7 +697,84 @@ def inspect_legacy_schema(connection: Connection) -> SchemaInspectionResult:
                         "error": "Invalid password_updated_at column",
                     },
                 )
-            if not _has_positive_credential_version_check(connection, inspector):
+            if not _has_positive_credential_version_check(
+                connection, inspector, "password_credentials"
+            ):
+                return SchemaInspectionResult(
+                    state=SchemaState.UNKNOWN,
+                    details={
+                        "table": "password_credentials",
+                        "error": "Missing credential_version check constraint",
+                    },
+                )
+            sess_v_col = session_cols["credential_version"]
+            if sess_v_col["nullable"] is not False or not _is_int_type(
+                sess_v_col["type"]
+            ):
+                return SchemaInspectionResult(
+                    state=SchemaState.UNKNOWN,
+                    details={
+                        "table": "sessions",
+                        "error": "Invalid credential_version column",
+                    },
+                )
+            if not _has_positive_credential_version_check(
+                connection, inspector, "sessions"
+            ):
+                return SchemaInspectionResult(
+                    state=SchemaState.UNKNOWN,
+                    details={
+                        "table": "sessions",
+                        "error": "Missing credential_version check constraint on sessions",
+                    },
+                )
+            if not (has_user_idx and has_expires_idx):
+                return SchemaInspectionResult(
+                    state=SchemaState.UNKNOWN,
+                    details={"table": "sessions", "error": "Missing session indexes"},
+                )
+            return SchemaInspectionResult(
+                state=SchemaState.UNVERSIONED_CURRENT,
+                stamp_revision="0005_add_session_credential_version",
+                target_revision="head",
+            )
+        elif (
+            "credential_version" in cred_cols
+            and "credential_version" not in session_cols
+        ):
+            cred_v_col = cred_cols["credential_version"]
+            if cred_v_col["nullable"] is not False or not _is_int_type(
+                cred_v_col["type"]
+            ):
+                return SchemaInspectionResult(
+                    state=SchemaState.UNKNOWN,
+                    details={
+                        "table": "password_credentials",
+                        "error": "Invalid credential_version column",
+                    },
+                )
+            if "password_updated_at" not in cred_cols:
+                return SchemaInspectionResult(
+                    state=SchemaState.UNKNOWN,
+                    details={
+                        "table": "password_credentials",
+                        "error": "Missing password_updated_at on 0004 schema",
+                    },
+                )
+            pwd_col = cred_cols["password_updated_at"]
+            if pwd_col["nullable"] is not False or not _is_datetime_type(
+                pwd_col["type"]
+            ):
+                return SchemaInspectionResult(
+                    state=SchemaState.UNKNOWN,
+                    details={
+                        "table": "password_credentials",
+                        "error": "Invalid password_updated_at column",
+                    },
+                )
+            if not _has_positive_credential_version_check(
+                connection, inspector, "password_credentials"
+            ):
                 return SchemaInspectionResult(
                     state=SchemaState.UNKNOWN,
                     details={
@@ -624,11 +788,15 @@ def inspect_legacy_schema(connection: Connection) -> SchemaInspectionResult:
                     details={"table": "sessions", "error": "Missing session indexes"},
                 )
             return SchemaInspectionResult(
-                state=SchemaState.UNVERSIONED_CURRENT,
+                state=SchemaState.UNVERSIONED_A4,
                 stamp_revision="0004_add_credential_version",
                 target_revision="head",
             )
-        elif "password_updated_at" in cred_cols:
+        elif (
+            "password_updated_at" in cred_cols
+            and "credential_version" not in cred_cols
+            and "credential_version" not in session_cols
+        ):
             pwd_col = cred_cols["password_updated_at"]
             if pwd_col["nullable"] is not False or not _is_datetime_type(
                 pwd_col["type"]
@@ -650,11 +818,20 @@ def inspect_legacy_schema(connection: Connection) -> SchemaInspectionResult:
                 stamp_revision="0003_add_session_indexes",
                 target_revision="head",
             )
-        else:
+        elif (
+            "password_updated_at" not in cred_cols
+            and "credential_version" not in cred_cols
+            and "credential_version" not in session_cols
+        ):
             return SchemaInspectionResult(
                 state=SchemaState.UNVERSIONED_A2,
                 stamp_revision="0001_initial_schema",
                 target_revision="head",
+            )
+        else:
+            return SchemaInspectionResult(
+                state=SchemaState.UNKNOWN,
+                details={"error": "Schema in inconsistent intermediate state"},
             )
 
     except (

@@ -128,6 +128,18 @@ class SessionMixin:
         )
 
     @declared_attr
+    def credential_version(cls) -> Mapped[int]:
+        return mapped_column(
+            Integer,
+            CheckConstraint(
+                "credential_version >= 1",
+                name="ck_sessions_credential_version_positive",
+            ),
+            default=1,
+            nullable=False,
+        )
+
+    @declared_attr
     def created_at(cls) -> Mapped[datetime]:
         return mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 

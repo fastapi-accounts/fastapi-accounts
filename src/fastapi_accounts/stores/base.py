@@ -66,6 +66,14 @@ class UserStoreProtocol(Protocol):
         self, session: AsyncSession, user_id: uuid.UUID, current_raw_token: str
     ) -> int: ...
 
+    async def update_session_credential_version(
+        self, session: AsyncSession, raw_token: str, new_credential_version: int
+    ) -> bool: ...
+
+    async def update_all_user_sessions_credential_version(
+        self, session: AsyncSession, user_id: uuid.UUID, new_credential_version: int
+    ) -> int: ...
+
     async def update_password_if_version(
         self,
         session: AsyncSession,

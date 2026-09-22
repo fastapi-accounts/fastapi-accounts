@@ -899,3 +899,278 @@ async def test_rate_limiter_expired_key_renewal_under_capacity():
 
     # key_short was expired and cleaned; key_long must still be retained because its 3600s window was preserved
     assert "key_long" in limiter._windows
+
+
+@pytest.mark.asyncio
+async def test_login_reset_adapter_flush_boundary_race():
+    """F1 / High: Concurrency race when session insertion is delayed at flush boundary.
+
+    Even if an in-flight login executes after verifying an older credential version,
+    the issued session has sessions.credential_version = 1.
+    Once password reset commits (bumping credential_version to 2),
+    accessing /me with the in-flight login's session MUST return 401 Unauthorized.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = os.path.join(tmp, "race_flush.db")
+        engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+        adapter = SQLAlchemyAdapter(engine=engine)
+        accounts = FastAPIAccounts(
+            adapter=adapter,
+            secret_key="flush-boundary-race-test-secret-key-32bytes",
+            transport=CookieTransport(cookie_secure=False),
+        )
+        app = FastAPI()
+        app.include_router(accounts.router, prefix="/api/v1/auth")
+        transport = ASGITransport(app=app)
+
+        original_create_session = adapter.create_session
+        reached_insert = asyncio.Event()
+        release_insert = asyncio.Event()
+        intercept_active = False
+
+        async def paused_create_session(session: AsyncSession, *args, **kwargs):
+            if intercept_active:
+                reached_insert.set()
+                await release_insert.wait()
+            return await original_create_session(session, *args, **kwargs)
+
+        adapter.create_session = paused_create_session
+
+        try:
+            async with (
+                AsyncClient(transport=transport, base_url="http://test") as victim,
+                AsyncClient(transport=transport, base_url="http://test") as attacker,
+            ):
+
+                async def csrf(client: AsyncClient) -> dict[str, str]:
+                    r = await client.get("/api/v1/auth/csrf")
+                    return {
+                        "Origin": "http://test",
+                        "X-CSRF-Token": r.json()["csrf_token"],
+                    }
+
+                # 1. Register victim
+                reg = await victim.post(
+                    "/api/v1/auth/register",
+                    json={
+                        "email": "flushrace@example.com",
+                        "password": "OldPassword123!",
+                    },
+                    headers=await csrf(victim),
+                )
+                assert reg.status_code == 201
+
+                # 2. Generate password reset token
+                async with adapter.session_maker() as db:
+                    user = await adapter.get_user_by_email(db, "flushrace@example.com")
+                    assert user is not None
+                    token = accounts.service.generate_password_reset_token(
+                        user.id, "flushrace@example.com", credential_version=1
+                    )
+
+                # 3. Arm session creation interception and start attacker login
+                intercept_active = True
+                attacker_task = asyncio.create_task(
+                    attacker.post(
+                        "/api/v1/auth/login",
+                        json={
+                            "email": "flushrace@example.com",
+                            "password": "OldPassword123!",
+                        },
+                        headers=await csrf(attacker),
+                    )
+                )
+
+                # 4. Wait until attacker login is paused inside create_session
+                await asyncio.wait_for(reached_insert.wait(), timeout=5.0)
+
+                # 5. Victim resets password to NewPassword456! (bumping version to 2)
+                reset = await victim.post(
+                    "/api/v1/auth/reset-password",
+                    json={"token": token, "new_password": "NewPassword456!"},
+                    headers=await csrf(victim),
+                )
+                assert reset.status_code == 200
+
+                # Victim's previous session must be invalidated
+                assert (await victim.get("/api/v1/auth/me")).status_code == 401
+
+                # 6. Release attacker's paused create_session
+                release_insert.set()
+                _attacker_login_resp = await attacker_task
+
+                # 7. Non-negotiable security invariant:
+                # Regardless of whether attacker's login HTTP status is 200 or 401,
+                # any authenticated request on /me using that issued session MUST BE 401 Unauthorized.
+                attacker_me_resp = await attacker.get("/api/v1/auth/me")
+                assert attacker_me_resp.status_code == 401
+
+                # 8. Subsequent login with old password fails
+                fresh_old_resp = await attacker.post(
+                    "/api/v1/auth/login",
+                    json={
+                        "email": "flushrace@example.com",
+                        "password": "OldPassword123!",
+                    },
+                    headers=await csrf(attacker),
+                )
+                assert fresh_old_resp.status_code == 401
+        finally:
+            adapter.create_session = original_create_session
+            await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_create_session_omitted_version_preserves_active_generation():
+    """F1: Calling create_session with expected_credential_version=None dynamically resolves active version."""
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = os.path.join(tmp, "omitted_version.db")
+        engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+        adapter = SQLAlchemyAdapter(engine=engine)
+        accounts = FastAPIAccounts(
+            adapter=adapter,
+            secret_key="omitted-version-secret-key-32-bytes-long",
+            transport=CookieTransport(cookie_secure=False),
+        )
+        app = FastAPI()
+        app.include_router(accounts.router, prefix="/api/v1/auth")
+        transport = ASGITransport(app=app)
+
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+
+            async def csrf() -> dict[str, str]:
+                r = await client.get("/api/v1/auth/csrf")
+                return {"Origin": "http://test", "X-CSRF-Token": r.json()["csrf_token"]}
+
+            # 1. Register user (starts at version 1)
+            reg = await client.post(
+                "/api/v1/auth/register",
+                json={"email": "omitted@example.com", "password": "Password123!"},
+                headers=await csrf(),
+            )
+            assert reg.status_code == 201
+
+            # Login to authenticate
+            login_resp = await client.post(
+                "/api/v1/auth/login",
+                json={"email": "omitted@example.com", "password": "Password123!"},
+                headers=await csrf(),
+            )
+            assert login_resp.status_code == 200
+
+            # 2. Change password via API to advance credential_version to 2
+            change = await client.post(
+                "/api/v1/auth/change-password",
+                json={
+                    "current_password": "Password123!",
+                    "new_password": "NewPassword123!",
+                },
+                headers=await csrf(),
+            )
+            assert change.status_code == 200
+
+            # 3. Create a session via service with expected_credential_version=None
+            async with adapter.session_maker() as db:
+                user = await adapter.get_user_by_email(db, "omitted@example.com")
+                assert user is not None
+                raw_token, _session_id = await accounts.service.create_session(
+                    session=db,
+                    user_id=user.id,
+                    expected_credential_version=None,
+                )
+                await db.commit()
+
+            # 4. Authenticate session directly
+            async with adapter.session_maker() as db:
+                auth_res = await adapter.get_session_and_user(db, raw_token)
+                assert auth_res is not None
+                sess_rec, user_rec = auth_res
+                # Must have resolved user's active version (2), NOT defaulted to 1
+                assert sess_rec.credential_version == 2
+                assert user_rec.id == user.id
+
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_change_password_preserves_current_session_with_generation_bump():
+    """F1: change_password increments credential_version on both credentials and the current session."""
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = os.path.join(tmp, "change_preserve.db")
+        engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+        adapter = SQLAlchemyAdapter(engine=engine)
+        accounts = FastAPIAccounts(
+            adapter=adapter,
+            secret_key="change-preserve-secret-key-32-bytes-long",
+            transport=CookieTransport(cookie_secure=False),
+        )
+        app = FastAPI()
+        app.include_router(accounts.router, prefix="/api/v1/auth")
+        transport = ASGITransport(app=app)
+
+        async with (
+            AsyncClient(transport=transport, base_url="http://test") as active_client,
+            AsyncClient(transport=transport, base_url="http://test") as other_client,
+        ):
+
+            async def csrf(c: AsyncClient) -> dict[str, str]:
+                r = await c.get("/api/v1/auth/csrf")
+                return {"Origin": "http://test", "X-CSRF-Token": r.json()["csrf_token"]}
+
+            # 1. Register user
+            reg = await active_client.post(
+                "/api/v1/auth/register",
+                json={"email": "preserve@example.com", "password": "Password123!"},
+                headers=await csrf(active_client),
+            )
+            assert reg.status_code == 201
+
+            # 2. Login active_client
+            active_login = await active_client.post(
+                "/api/v1/auth/login",
+                json={"email": "preserve@example.com", "password": "Password123!"},
+                headers=await csrf(active_client),
+            )
+            assert active_login.status_code == 200
+
+            # 3. Login other_client
+            other_login = await other_client.post(
+                "/api/v1/auth/login",
+                json={"email": "preserve@example.com", "password": "Password123!"},
+                headers=await csrf(other_client),
+            )
+            assert other_login.status_code == 200
+
+            # Both can access /me
+            assert (await active_client.get("/api/v1/auth/me")).status_code == 200
+            assert (await other_client.get("/api/v1/auth/me")).status_code == 200
+
+            # 4. active_client changes password
+            change = await active_client.post(
+                "/api/v1/auth/change-password",
+                json={
+                    "current_password": "Password123!",
+                    "new_password": "NewPassword123!",
+                },
+                headers=await csrf(active_client),
+            )
+            assert change.status_code == 200
+
+            # 5. active_client MUST still be authenticated (current session updated to version 2)
+            active_me = await active_client.get("/api/v1/auth/me")
+            assert active_me.status_code == 200
+
+            # 6. other_client MUST be revoked / unauthorized
+            other_me = await other_client.get("/api/v1/auth/me")
+            assert other_me.status_code == 401
+
+        await engine.dispose()

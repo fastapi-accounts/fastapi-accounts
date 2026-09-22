@@ -147,7 +147,7 @@ alembic check
 
 ### Safe Legacy Database Upgrade Workflow
 
-If upgrading an existing database initialized with `v0.1.0a2` or `v0.1.0a3` using `adapter.create_all()`:
+If upgrading an existing database initialized with `v0.1.0a2`, `v0.1.0a3`, or `v0.1.0a4` using `adapter.create_all()`:
 
 1. **Back up your database** prior to executing schema commands.
 2. **Inspect your schema** to verify compatibility:
@@ -165,7 +165,12 @@ If upgrading an existing database initialized with `v0.1.0a2` or `v0.1.0a3` usin
      ```bash
      alembic upgrade head
      ```
-   * **If `UNVERSIONED_CURRENT`** (unmanaged schema with `credential_version` and indexes):
+   * **If `UNVERSIONED_CURRENT`** (unmanaged schema with `password_credentials.credential_version` and `sessions.credential_version`):
+     ```bash
+     alembic stamp 0005_add_session_credential_version
+     alembic upgrade head
+     ```
+   * **If `UNVERSIONED_A4`** (unmanaged schema containing `password_credentials.credential_version` but lacking `sessions.credential_version`):
      ```bash
      alembic stamp 0004_add_credential_version
      alembic upgrade head
@@ -181,6 +186,11 @@ If upgrading an existing database initialized with `v0.1.0a2` or `v0.1.0a3` usin
      alembic upgrade head
      ```
    * **If `UNKNOWN`:** Do not stamp; inspect your database schema for custom modifications or structural discrepancies.
+
+> [!IMPORTANT]
+> **Custom Model Notice (0.1.0a5 Upgrade):**  
+> If defining custom session models, your `Session` model must inherit from `SessionMixin` or declare `credential_version: Mapped[int] = mapped_column(sa.Integer, default=1, nullable=False)` with check constraint `credential_version >= 1`.
+
 
 ---
 

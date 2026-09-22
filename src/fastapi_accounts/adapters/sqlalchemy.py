@@ -3,7 +3,9 @@ from __future__ import annotations
 import uuid
 from collections.abc import AsyncGenerator
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
+import sqlalchemy as sa
 from sqlalchemy import CursorResult, delete, select, update
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -171,54 +173,171 @@ class SQLAlchemyAdapter:
         ip_address: str | None = None,
         user_agent: str | None = None,
     ) -> Session:
-        """Create a new active session record storing hashed token."""
+        """Create a new active session record storing hashed token bound to credential generation."""
+        token_id = hash_token(raw_token)
+        now = utc_now()
+        expires_at = now + timedelta(seconds=max_age_seconds)
+
+        bind = session.bind or getattr(self, "engine", None)
+        is_sqlite = (
+            bind is not None
+            and getattr(bind, "dialect", None) is not None
+            and bind.dialect.name == "sqlite"
+        )
+
         if expected_credential_version is not None:
             if (
                 type(expected_credential_version) is not int
                 or expected_credential_version < 1
             ):
                 raise ValueError("Invalid expected_credential_version")
-            stmt = select(self.credential_model).where(
-                self.credential_model.user_id == user_id,
-                self.credential_model.credential_version == expected_credential_version,
+
+            if not is_sqlite:
+                lock_stmt = (
+                    select(self.credential_model)
+                    .where(
+                        self.credential_model.user_id == user_id,
+                        self.credential_model.credential_version
+                        == expected_credential_version,
+                    )
+                    .with_for_update()
+                )
+                cred = (await session.execute(lock_stmt)).scalars().first()
+                if not cred:
+                    raise ValueError(
+                        "Credential version mismatch during session creation"
+                    )
+
+            select_stmt = (
+                select(
+                    sa.literal(token_id).label("id"),
+                    sa.literal(user_id).label("user_id"),
+                    self.credential_model.credential_version.label(
+                        "credential_version"
+                    ),
+                    sa.literal(now).label("created_at"),
+                    sa.literal(expires_at).label("expires_at"),
+                    sa.literal(ip_address).label("ip_address"),
+                    sa.literal(user_agent).label("user_agent"),
+                )
+                .select_from(self.credential_model)
+                .where(
+                    self.credential_model.user_id == user_id,
+                    self.credential_model.credential_version
+                    == expected_credential_version,
+                )
             )
-            bind = session.bind or getattr(self, "engine", None)
-            if (
-                bind
-                and getattr(bind, "dialect", None)
-                and bind.dialect.name != "sqlite"
-            ):
-                stmt = stmt.with_for_update()
-            cred = (await session.execute(stmt)).scalars().first()
-            if not cred:
+
+            insert_stmt = sa.insert(self.session_model).from_select(
+                [
+                    "id",
+                    "user_id",
+                    "credential_version",
+                    "created_at",
+                    "expires_at",
+                    "ip_address",
+                    "user_agent",
+                ],
+                select_stmt,
+            )
+            result = await session.execute(insert_stmt)
+            count = (
+                result.rowcount
+                if isinstance(result, CursorResult)
+                else (getattr(result, "rowcount", 0) or 0)
+            )
+            if count != 1:
                 raise ValueError("Credential version mismatch during session creation")
 
-        token_id = hash_token(raw_token)
-        expires_at = utc_now() + timedelta(seconds=max_age_seconds)
+            session_record = self.session_model(
+                id=token_id,
+                user_id=user_id,
+                credential_version=expected_credential_version,
+                created_at=now,
+                expires_at=expires_at,
+                ip_address=ip_address,
+                user_agent=user_agent,
+            )
+            return session_record
+        else:
+            select_stmt = (
+                select(
+                    sa.literal(token_id).label("id"),
+                    sa.literal(user_id).label("user_id"),
+                    sa.func.coalesce(self.credential_model.credential_version, 1).label(
+                        "credential_version"
+                    ),
+                    sa.literal(now).label("created_at"),
+                    sa.literal(expires_at).label("expires_at"),
+                    sa.literal(ip_address).label("ip_address"),
+                    sa.literal(user_agent).label("user_agent"),
+                )
+                .select_from(self.user_model)
+                .outerjoin(
+                    self.credential_model,
+                    self.credential_model.user_id == self.user_model.id,
+                )
+                .where(self.user_model.id == user_id)
+            )
 
-        session_record = self.session_model(
-            id=token_id,
-            user_id=user_id,
-            expires_at=expires_at,
-            ip_address=ip_address,
-            user_agent=user_agent,
-        )
-        session.add(session_record)
-        await session.flush()
-        return session_record
+            insert_stmt = sa.insert(self.session_model).from_select(
+                [
+                    "id",
+                    "user_id",
+                    "credential_version",
+                    "created_at",
+                    "expires_at",
+                    "ip_address",
+                    "user_agent",
+                ],
+                select_stmt,
+            )
+            result = await session.execute(insert_stmt)
+            count = (
+                result.rowcount
+                if isinstance(result, CursorResult)
+                else (getattr(result, "rowcount", 0) or 0)
+            )
+            if count != 1:
+                raise ValueError("Failed creating session for user")
+
+            query_stmt = select(self.session_model).where(
+                self.session_model.id == token_id
+            )
+            session_res: Any = (await session.execute(query_stmt)).scalars().first()
+            if not session_res:
+                session_res = self.session_model(
+                    id=token_id,
+                    user_id=user_id,
+                    credential_version=1,
+                    created_at=now,
+                    expires_at=expires_at,
+                    ip_address=ip_address,
+                    user_agent=user_agent,
+                )
+            return session_res
 
     async def get_session_and_user(
         self, session: AsyncSession, raw_token: str
     ) -> tuple[Session, User] | None:
-        """Retrieve active unexpired session and user by raw token."""
+        """Retrieve active unexpired session and user by raw token matching credential generation."""
         token_id = hash_token(raw_token)
         stmt = (
             select(self.session_model, self.user_model)
             .join(self.user_model, self.user_model.id == self.session_model.user_id)
+            .outerjoin(
+                self.credential_model,
+                self.credential_model.user_id == self.user_model.id,
+            )
             .where(
                 self.session_model.id == token_id,
                 self.session_model.expires_at > utc_now(),
                 self.user_model.is_active.is_(True),
+                sa.or_(
+                    self.credential_model.id.is_(None),
+                    self.session_model.credential_version
+                    == self.credential_model.credential_version,
+                ),
             )
         )
         result = await session.execute(stmt)
@@ -226,6 +345,40 @@ class SQLAlchemyAdapter:
         if not row:
             return None
         return row[0], row[1]
+
+    async def update_session_credential_version(
+        self, session: AsyncSession, raw_token: str, new_credential_version: int
+    ) -> bool:
+        """Update active session record to new credential generation."""
+        token_id = hash_token(raw_token)
+        stmt = (
+            update(self.session_model)
+            .where(self.session_model.id == token_id)
+            .values(credential_version=new_credential_version)
+        )
+        result = await session.execute(stmt)
+        count = (
+            result.rowcount
+            if isinstance(result, CursorResult)
+            else (getattr(result, "rowcount", 0) or 0)
+        )
+        return count == 1
+
+    async def update_all_user_sessions_credential_version(
+        self, session: AsyncSession, user_id: uuid.UUID, new_credential_version: int
+    ) -> int:
+        """Update all active session records for a user to new credential generation."""
+        stmt = (
+            update(self.session_model)
+            .where(self.session_model.user_id == user_id)
+            .values(credential_version=new_credential_version)
+        )
+        result = await session.execute(stmt)
+        return (
+            result.rowcount
+            if isinstance(result, CursorResult)
+            else (getattr(result, "rowcount", 0) or 0)
+        )
 
     async def revoke_session(self, session: AsyncSession, raw_token: str) -> bool:
         """Delete an active session by token."""

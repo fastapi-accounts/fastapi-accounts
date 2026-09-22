@@ -80,6 +80,38 @@ async def test_postgres_migration_and_cas_concurrency():
         assert cred.credential_version == 2
         assert cred.hashed_password == winner_hash
 
+    # Test concurrent session creation and password reset on Postgres
+    async with session_maker() as s:
+        # Create session bound to version 2
+        sess_rec, raw_tok = await adapter.create_session(
+            session=s,
+            user_id=user_id,
+            expected_credential_version=2,
+        )
+        await s.commit()
+        assert sess_rec.credential_version == 2
+
+    # Verify session authenticates
+    async with session_maker() as s:
+        auth_res = await adapter.get_session_and_user(s, raw_tok)
+        assert auth_res is not None
+
+    # Reset password to version 3
+    async with session_maker() as s:
+        ok = await adapter.atomic_reset_password(
+            session=s,
+            user_id=user_id,
+            expected_cred_v=2,
+            new_hashed_password="$argon2id$v3",
+        )
+        assert ok is True
+        await s.commit()
+
+    # Old session bound to version 2 must immediately fail authentication
+    async with session_maker() as s:
+        auth_res = await adapter.get_session_and_user(s, raw_tok)
+        assert auth_res is None
+
     # Verify complete downgrade to base and re-upgrade to head
     command.downgrade(alembic_cfg, "base")
     command.upgrade(alembic_cfg, "head")

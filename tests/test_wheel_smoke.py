@@ -37,6 +37,7 @@ def test_migrations_package_resources():
         "0002_add_password_updated_at",
         "0003_add_session_indexes",
         "0004_add_credential_version",
+        "0005_add_session_credential_version",
     ]
     for rev in expected_revisions:
         assert rev in version_modules, f"Missing migration revision: {rev}"
