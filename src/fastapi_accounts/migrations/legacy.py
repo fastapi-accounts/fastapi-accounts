@@ -55,11 +55,18 @@ def _is_datetime_type(col_type: Any) -> bool:
     return "TIMESTAMP" in t or "DATETIME" in t
 
 
-def _is_string_type(col_type: Any, min_length: int | None = None) -> bool:
+def _is_string_type(
+    col_type: Any, min_length: int | None = None, allow_uuid: bool = False
+) -> bool:
     t = str(col_type).upper()
-    if not any(k in t for k in ("CHAR", "VARCHAR", "STRING", "TEXT", "UUID")):
+    valid_keywords: tuple[str, ...] = (
+        ("CHAR", "VARCHAR", "STRING", "TEXT", "UUID")
+        if allow_uuid
+        else ("CHAR", "VARCHAR", "STRING", "TEXT")
+    )
+    if not any(k in t for k in valid_keywords):
         return False
-    if min_length is not None:
+    if min_length is not None and not (allow_uuid and "UUID" in t):
         length = getattr(col_type, "length", None)
         if length is not None and length < min_length:
             return False
@@ -215,7 +222,7 @@ def inspect_legacy_schema(connection: Connection) -> SchemaInspectionResult:
                         "error": f"Column {col_name} is nullable",
                     },
                 )
-        if not _is_string_type(user_cols["id"]["type"], min_length=32):
+        if not _is_string_type(user_cols["id"]["type"], min_length=32, allow_uuid=True):
             return SchemaInspectionResult(
                 state=SchemaState.UNKNOWN,
                 details={"table": "users", "error": "Invalid id type"},
@@ -266,9 +273,15 @@ def inspect_legacy_schema(connection: Connection) -> SchemaInspectionResult:
                     },
                 )
         if (
-            not _is_string_type(email_cols["id"]["type"], min_length=32)
-            or not _is_string_type(email_cols["user_id"]["type"], min_length=32)
-            or not _is_string_type(email_cols["email"]["type"], min_length=320)
+            not _is_string_type(
+                email_cols["id"]["type"], min_length=32, allow_uuid=True
+            )
+            or not _is_string_type(
+                email_cols["user_id"]["type"], min_length=32, allow_uuid=True
+            )
+            or not _is_string_type(
+                email_cols["email"]["type"], min_length=320, allow_uuid=False
+            )
         ):
             return SchemaInspectionResult(
                 state=SchemaState.UNKNOWN,
@@ -360,10 +373,18 @@ def inspect_legacy_schema(connection: Connection) -> SchemaInspectionResult:
                 },
             )
         if (
-            not _is_string_type(session_cols["id"]["type"], min_length=64)
-            or not _is_string_type(session_cols["user_id"]["type"], min_length=32)
-            or not _is_string_type(session_cols["ip_address"]["type"], min_length=45)
-            or not _is_string_type(session_cols["user_agent"]["type"], min_length=512)
+            not _is_string_type(
+                session_cols["id"]["type"], min_length=64, allow_uuid=False
+            )
+            or not _is_string_type(
+                session_cols["user_id"]["type"], min_length=32, allow_uuid=True
+            )
+            or not _is_string_type(
+                session_cols["ip_address"]["type"], min_length=45, allow_uuid=False
+            )
+            or not _is_string_type(
+                session_cols["user_agent"]["type"], min_length=512, allow_uuid=False
+            )
         ):
             return SchemaInspectionResult(
                 state=SchemaState.UNKNOWN,
@@ -424,10 +445,14 @@ def inspect_legacy_schema(connection: Connection) -> SchemaInspectionResult:
                     },
                 )
         if (
-            not _is_string_type(cred_cols["id"]["type"], min_length=32)
-            or not _is_string_type(cred_cols["user_id"]["type"], min_length=32)
+            not _is_string_type(cred_cols["id"]["type"], min_length=32, allow_uuid=True)
             or not _is_string_type(
-                cred_cols["hashed_password"]["type"], min_length=1024
+                cred_cols["user_id"]["type"], min_length=32, allow_uuid=True
+            )
+            or not _is_string_type(
+                cred_cols["hashed_password"]["type"],
+                min_length=1024,
+                allow_uuid=False,
             )
         ):
             return SchemaInspectionResult(

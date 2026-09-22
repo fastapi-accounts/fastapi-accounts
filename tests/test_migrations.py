@@ -547,6 +547,10 @@ def test_inspect_legacy_schema_outcomes():
             for c in list(table.constraints):
                 if isinstance(c, sa.PrimaryKeyConstraint):
                     table.constraints.remove(c)
+            for col in table.c:
+                col.primary_key = False
+            table.c.id.primary_key = True
+            table.c[col_name].primary_key = True
             table.append_constraint(
                 sa.PrimaryKeyConstraint(table.c.id, table.c[col_name])
             )
@@ -750,7 +754,34 @@ def test_inspect_legacy_schema_outcomes():
                 "session_ua_not_null",
                 lambda m: setattr(m.tables["sessions"].c.user_agent, "nullable", False),
             ),
-            # 8. Foreign key targets
+            # 8. Non-ID columns with UUID type (rejected)
+            (
+                "email_uuid_rejected",
+                lambda m: setattr(
+                    m.tables["email_addresses"].c.email, "type", sa.Uuid()
+                ),
+            ),
+            (
+                "password_hash_uuid_rejected",
+                lambda m: setattr(
+                    m.tables["password_credentials"].c.hashed_password,
+                    "type",
+                    sa.Uuid(),
+                ),
+            ),
+            (
+                "session_id_uuid_rejected",
+                lambda m: setattr(m.tables["sessions"].c.id, "type", sa.Uuid()),
+            ),
+            (
+                "session_ip_uuid_rejected",
+                lambda m: setattr(m.tables["sessions"].c.ip_address, "type", sa.Uuid()),
+            ),
+            (
+                "session_ua_uuid_rejected",
+                lambda m: setattr(m.tables["sessions"].c.user_agent, "type", sa.Uuid()),
+            ),
+            # 9. Foreign key targets
             (
                 "email_fk_wrong_target",
                 lambda m: replace_fk(m.tables["email_addresses"], "users", "is_active"),
