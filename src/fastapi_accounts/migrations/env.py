@@ -1,13 +1,17 @@
 import asyncio
+import logging
 import os
 from logging.config import fileConfig
 
+import sqlalchemy as sa
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from fastapi_accounts.models.default import Base
+
+logger = logging.getLogger("fastapi_accounts.migrations")
 
 config = context.config
 
@@ -56,7 +60,23 @@ def do_run_migrations(connection: Connection) -> None:
         render_as_batch=True,
     )
 
+    is_mutating = "destination_rev" in context.get_context().opts
+
     with context.begin_transaction():
+        if is_mutating and not context.is_offline_mode():
+            try:
+                inspector = sa.inspect(connection)
+                if "alembic_version" in inspector.get_table_names():
+                    connection.execute(
+                        sa.text(
+                            "UPDATE alembic_version "
+                            "SET version_num = '0005_add_session_cred_version' "
+                            "WHERE version_num = '0005_add_session_credential_version'"
+                        )
+                    )
+            except Exception as e:
+                logger.debug("Legacy revision normalization skipped: %s", e)
+
         context.run_migrations()
 
 
@@ -72,7 +92,7 @@ async def run_async_migrations() -> None:
         poolclass=pool.NullPool,
     )
 
-    async with connectable.connect() as connection:
+    async with connectable.begin() as connection:
         await connection.run_sync(do_run_migrations)
 
     await connectable.dispose()
@@ -114,7 +134,7 @@ def run_migrations_online() -> None:
             prefix="sqlalchemy.",
             poolclass=pool.NullPool,
         )
-        with sync_engine.connect() as connection:
+        with sync_engine.begin() as connection:
             do_run_migrations(connection)
         sync_engine.dispose()
 

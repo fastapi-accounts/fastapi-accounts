@@ -12,8 +12,9 @@ from fastapi_accounts.adapters.sqlalchemy import SQLAlchemyAdapter
 from fastapi_accounts.migrations import (
     get_alembic_config,
     inspect_legacy_schema,
+    normalize_legacy_revision,
 )
-from fastapi_accounts.migrations.legacy import SchemaState
+from fastapi_accounts.migrations.legacy import SchemaState, _is_string_type
 from fastapi_accounts.models.default import Base
 
 
@@ -280,7 +281,7 @@ async def test_migration_adopt_unversioned_current_schema():
         with sync_engine.connect() as conn:
             res = inspect_legacy_schema(conn)
             assert res.state == SchemaState.UNVERSIONED_CURRENT
-            assert res.stamp_revision == "0005_add_session_credential_version"
+            assert res.stamp_revision == "0005_add_session_cred_version"
 
         alembic_cfg = get_alembic_config(sync_db_url)
         command.stamp(alembic_cfg, res.stamp_revision)
@@ -356,7 +357,7 @@ async def test_migration_0005_backfill_and_reversibility():
             conn.commit()
 
         # Upgrade to 0005
-        command.upgrade(alembic_cfg, "0005_add_session_credential_version")
+        command.upgrade(alembic_cfg, "0005_add_session_cred_version")
         command.check(alembic_cfg)
 
         with engine.connect() as conn:
@@ -583,7 +584,7 @@ def test_inspect_legacy_schema_outcomes():
                     )
                     conn.execute(
                         text(
-                            "INSERT INTO alembic_version (version_num) VALUES ('0005_add_session_credential_version')"
+                            "INSERT INTO alembic_version (version_num) VALUES ('0005_add_session_cred_version')"
                         )
                     )
                     conn.commit()
@@ -906,3 +907,164 @@ def test_migration_0005_rejects_pre_existing_drift():
         # Upgrading to head (0005) must fail closed with RuntimeError
         with pytest.raises(RuntimeError, match="Schema drift detected"):
             command.upgrade(alembic_cfg, "head")
+
+
+def test_is_string_type_native_postgresql_uuid():
+    """Verify _is_string_type against native PostgreSQL types (UUID, VARCHAR, TEXT)."""
+    from sqlalchemy.dialects import postgresql
+
+    # 1. Negative controls: Non-ID columns must reject native UUID (default and explicit allow_uuid=False)
+    assert _is_string_type(postgresql.UUID(), min_length=320) is False
+    assert (
+        _is_string_type(postgresql.UUID(), min_length=1024, allow_uuid=False) is False
+    )
+    assert _is_string_type(postgresql.UUID(), min_length=64, allow_uuid=False) is False
+    assert _is_string_type(postgresql.UUID(), min_length=45, allow_uuid=False) is False
+    assert _is_string_type(postgresql.UUID(), min_length=512, allow_uuid=False) is False
+    assert (
+        _is_string_type(postgresql.UUID(), min_length=None, allow_uuid=False) is False
+    )
+
+    # 2. Positive controls: ID columns accept native UUID when allow_uuid=True
+    assert _is_string_type(postgresql.UUID(), min_length=32, allow_uuid=True) is True
+    assert (
+        _is_string_type(postgresql.UUID(as_uuid=True), min_length=32, allow_uuid=True)
+        is True
+    )
+    assert _is_string_type(sa.Uuid(), min_length=32, allow_uuid=True) is True
+
+    # 3. Positive controls: Standard bounded and unbounded string types
+    assert _is_string_type(sa.String(320), min_length=320, allow_uuid=False) is True
+    assert _is_string_type(sa.Text(), min_length=1024, allow_uuid=False) is True
+    assert (
+        _is_string_type(postgresql.VARCHAR(1024), min_length=1024, allow_uuid=False)
+        is True
+    )
+    assert (
+        _is_string_type(postgresql.VARCHAR(64), min_length=64, allow_uuid=False) is True
+    )
+    assert (
+        _is_string_type(postgresql.VARCHAR(45), min_length=45, allow_uuid=False) is True
+    )
+    assert (
+        _is_string_type(postgresql.VARCHAR(512), min_length=512, allow_uuid=False)
+        is True
+    )
+
+
+def test_migration_revision_id_capacity_and_graph():
+    """Assert all migration revisions fit Alembic VARCHAR(32) capacity and graph resolves to head."""
+    import importlib
+    import pkgutil
+
+    from alembic.script import ScriptDirectory
+
+    import fastapi_accounts.migrations.versions as vers_pkg
+
+    # 1. Discover all migration modules and check revision ID lengths
+    for _, mod_name, _ in pkgutil.iter_modules(vers_pkg.__path__):
+        mod = importlib.import_module(
+            f"fastapi_accounts.migrations.versions.{mod_name}"
+        )
+        rev = getattr(mod, "revision", None)
+        assert rev is not None, (
+            f"Migration module {mod_name} missing 'revision' attribute"
+        )
+        assert len(rev) <= 32, (
+            f"Migration revision '{rev}' in {mod_name} exceeds Alembic VARCHAR(32) limit (len={len(rev)})"
+        )
+
+    # 2. Verify Alembic ScriptDirectory resolves head to 0005_add_session_cred_version
+    alembic_cfg = get_alembic_config("sqlite:///:memory:")
+    script_dir = ScriptDirectory.from_config(alembic_cfg)
+    assert script_dir.get_current_head() == "0005_add_session_cred_version"
+
+
+def test_historical_0005_revision_compatibility_and_transactions():
+    """Verify historical 0005_add_session_credential_version database handling across Alembic operations."""
+    import alembic.util.exc
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = os.path.join(tmpdir, "historical_0005_test.db")
+        sync_db_url = f"sqlite:///{db_path}"
+        engine = create_engine(sync_db_url)
+
+        # 1. Initialize schema to head (creates valid 0005 schema with checks/indexes)
+        alembic_cfg = get_alembic_config(sync_db_url)
+        command.upgrade(alembic_cfg, "head")
+
+        # 2. Stamp legacy 35-character revision
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "UPDATE alembic_version SET version_num = '0005_add_session_credential_version'"
+                )
+            )
+
+        # 3. inspect_legacy_schema recognizes it as ALEMBIC_MANAGED without writing
+        with engine.connect() as conn:
+            res = inspect_legacy_schema(conn)
+            assert res.state == SchemaState.ALEMBIC_MANAGED
+
+            # Check alembic_version is still the legacy string (read-only verification)
+            ver = conn.execute(text("SELECT version_num FROM alembic_version")).scalar()
+            assert ver == "0005_add_session_credential_version"
+
+        # 4. Read-only Alembic inspection commands (current, check) raise CommandError without altering DB
+        with pytest.raises(alembic.util.exc.CommandError):
+            command.current(alembic_cfg)
+        with pytest.raises(alembic.util.exc.CommandError):
+            command.check(alembic_cfg)
+
+        with engine.connect() as conn:
+            ver = conn.execute(text("SELECT version_num FROM alembic_version")).scalar()
+            assert ver == "0005_add_session_credential_version"
+
+        # 5. Mutating command: upgrade to head normalizes to canonical revision and commits
+        command.upgrade(alembic_cfg, "head")
+
+        # 6. Verify persistence with a fresh engine and connection
+        engine.dispose()
+        fresh_engine = create_engine(sync_db_url)
+        with fresh_engine.connect() as conn:
+            ver = conn.execute(text("SELECT version_num FROM alembic_version")).scalar()
+            assert ver == "0005_add_session_cred_version"
+
+        # 7. Now canonical current() and check() succeed without errors
+        command.current(alembic_cfg)
+        command.check(alembic_cfg)
+
+        # 8. Test caller rollback on normalize_legacy_revision helper
+        with fresh_engine.begin() as conn:
+            conn.execute(
+                text(
+                    "UPDATE alembic_version SET version_num = '0005_add_session_credential_version'"
+                )
+            )
+
+        # In a transaction that rolls back, normalization must be reverted
+        try:
+            with fresh_engine.begin() as conn:
+                updated = normalize_legacy_revision(conn)
+                assert updated is True
+                raise RuntimeError("Simulate caller abort")
+        except RuntimeError:
+            pass
+
+        with fresh_engine.connect() as conn:
+            ver = conn.execute(text("SELECT version_num FROM alembic_version")).scalar()
+            assert ver == "0005_add_session_credential_version"
+
+        # In a transaction that commits, normalize_legacy_revision succeeds and persists
+        with fresh_engine.begin() as conn:
+            updated = normalize_legacy_revision(conn)
+            assert updated is True
+
+        with fresh_engine.connect() as conn:
+            ver = conn.execute(text("SELECT version_num FROM alembic_version")).scalar()
+            assert ver == "0005_add_session_cred_version"
+            # Calling helper on already-normalized DB returns False
+            updated2 = normalize_legacy_revision(conn)
+            assert updated2 is False
+
+        fresh_engine.dispose()

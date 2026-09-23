@@ -1,6 +1,6 @@
 """Add credential_version with check constraint to sessions table
 
-Revision ID: 0005_add_session_credential_version
+Revision ID: 0005_add_session_cred_version
 Revises: 0004_add_credential_version
 Create Date: 2026-09-22 00:00:00.000000
 
@@ -11,7 +11,7 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0005_add_session_credential_version"
+revision: str = "0005_add_session_cred_version"
 down_revision: str | None = "0004_add_credential_version"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None

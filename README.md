@@ -167,7 +167,7 @@ If upgrading an existing database initialized with `v0.1.0a2`, `v0.1.0a3`, or `v
      ```
    * **If `UNVERSIONED_CURRENT`** (unmanaged schema with `password_credentials.credential_version` and `sessions.credential_version`):
      ```bash
-     alembic stamp 0005_add_session_credential_version
+     alembic stamp 0005_add_session_cred_version
      alembic upgrade head
      ```
    * **If `UNVERSIONED_A4`** (unmanaged schema containing `password_credentials.credential_version` but lacking `sessions.credential_version`):

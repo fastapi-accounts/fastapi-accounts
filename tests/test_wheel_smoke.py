@@ -28,7 +28,7 @@ def test_subpackage_discoverability():
 
 
 def test_migrations_package_resources():
-    """Assert all 4 version files and script.py.mako are discoverable within migrations package."""
+    """Assert all 5 version files and script.py.mako are discoverable within migrations package and fit VARCHAR(32)."""
     import fastapi_accounts.migrations.versions as vers_pkg
 
     version_modules = [name for _, name, _ in pkgutil.iter_modules(vers_pkg.__path__)]
@@ -37,7 +37,10 @@ def test_migrations_package_resources():
         "0002_add_password_updated_at",
         "0003_add_session_indexes",
         "0004_add_credential_version",
-        "0005_add_session_credential_version",
+        "0005_add_session_cred_version",
     ]
     for rev in expected_revisions:
         assert rev in version_modules, f"Missing migration revision: {rev}"
+        assert len(rev) <= 32, (
+            f"Revision ID {rev} exceeds Alembic VARCHAR(32) capacity: {len(rev)}"
+        )

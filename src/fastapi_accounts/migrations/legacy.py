@@ -22,6 +22,7 @@ KNOWN_REVISIONS = {
     "0002_add_password_updated_at",
     "0003_add_session_indexes",
     "0004_add_credential_version",
+    "0005_add_session_cred_version",
     "0005_add_session_credential_version",
 }
 
@@ -528,7 +529,10 @@ def inspect_legacy_schema(connection: Connection) -> SchemaInspectionResult:
                         details={"error": f"Unknown alembic revision: {current_rev}"},
                     )
                 # Verify structural fingerprint matches the claimed revision
-                if current_rev == "0005_add_session_credential_version":
+                if current_rev in (
+                    "0005_add_session_cred_version",
+                    "0005_add_session_credential_version",
+                ):
                     if (
                         "credential_version" not in cred_cols
                         or "password_updated_at" not in cred_cols
@@ -784,7 +788,7 @@ def inspect_legacy_schema(connection: Connection) -> SchemaInspectionResult:
                 )
             return SchemaInspectionResult(
                 state=SchemaState.UNVERSIONED_CURRENT,
-                stamp_revision="0005_add_session_credential_version",
+                stamp_revision="0005_add_session_cred_version",
                 target_revision="head",
             )
         elif (

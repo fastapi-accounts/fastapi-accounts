@@ -1,15 +1,146 @@
 import asyncio
 import os
+import uuid
+from datetime import datetime, timezone
 
 import pytest
 import sqlalchemy as sa
 from alembic import command
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 from fastapi_accounts.adapters.sqlalchemy import SQLAlchemyAdapter
-from fastapi_accounts.migrations import get_alembic_config
+from fastapi_accounts.migrations import (
+    get_alembic_config,
+    inspect_legacy_schema,
+)
+from fastapi_accounts.migrations.legacy import SchemaState
+from fastapi_accounts.models.default import Base
+from fastapi_accounts.security.tokens import hash_token
 
 POSTGRES_URL = os.environ.get("TEST_POSTGRES_URL")
+
+
+async def wait_for_lock_block(
+    observer_session: AsyncSession,
+    waiter_pid: int,
+    blocker_pid: int,
+    timeout: float = 5.0,
+) -> bool:
+    """Observe that waiter_pid is physically blocked by blocker_pid via pg_stat_activity and pg_blocking_pids."""
+    start = asyncio.get_event_loop().time()
+    while asyncio.get_event_loop().time() - start < timeout:
+        res = await observer_session.execute(
+            sa.text(
+                "SELECT pid, wait_event_type, pg_blocking_pids(pid) "
+                "FROM pg_stat_activity "
+                "WHERE pid = :waiter_pid"
+            ),
+            {"waiter_pid": waiter_pid},
+        )
+        row = res.first()
+        if row:
+            wait_event_type = row[1]
+            blocking_pids = row[2] or []
+            if wait_event_type == "Lock" and blocker_pid in blocking_pids:
+                return True
+        await asyncio.sleep(0.02)
+    raise TimeoutError(
+        f"Waiter PID {waiter_pid} was not observed blocked by PID {blocker_pid} within {timeout}s"
+    )
+
+
+@pytest.mark.skipif(
+    not POSTGRES_URL,
+    reason="TEST_POSTGRES_URL not set (runs in CI with PostgreSQL container)",
+)
+@pytest.mark.asyncio
+async def test_postgres_native_uuid_and_schema_inspection():
+    """Verify PostgreSQL reflection and schema inspector on native UUID types (managed and unmanaged)."""
+    sync_pg_url = (
+        POSTGRES_URL.replace("postgresql+asyncpg://", "postgresql+psycopg://")
+        if "+asyncpg" in POSTGRES_URL
+        else POSTGRES_URL.replace("postgresql://", "postgresql+psycopg://")
+    )
+    sync_engine = sa.create_engine(sync_pg_url)
+    try:
+        # 1. Valid managed 0005 schema inspection on real PostgreSQL
+        alembic_cfg = get_alembic_config(sync_pg_url)
+        command.upgrade(alembic_cfg, "head")
+        with sync_engine.connect() as conn:
+            res = inspect_legacy_schema(conn)
+            assert res.state == SchemaState.ALEMBIC_MANAGED
+
+        # 2. Test invalid non-ID native UUID columns on PostgreSQL tables in both unmanaged and managed modes
+        invalid_columns = [
+            ("email_addresses", "email"),
+            ("password_credentials", "hashed_password"),
+            ("sessions", "id"),
+            ("sessions", "ip_address"),
+            ("sessions", "user_agent"),
+        ]
+        for table_name, col_name in invalid_columns:
+            # Mode A: Unmanaged schema with invalid native UUID on non-ID column
+            with sync_engine.begin() as conn:
+                conn.execute(
+                    sa.text("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+                )
+
+            meta = sa.MetaData()
+            for t in Base.metadata.tables.values():
+                cols = []
+                for col in t.columns:
+                    if t.name == table_name and col.name == col_name:
+                        cols.append(
+                            sa.Column(
+                                col.name,
+                                postgresql.UUID(),
+                                primary_key=col.primary_key,
+                                nullable=col.nullable,
+                            )
+                        )
+                    else:
+                        cols.append(col._copy())
+                sa.Table(t.name, meta, *cols)
+            meta.create_all(sync_engine)
+
+            with sync_engine.connect() as conn:
+                res = inspect_legacy_schema(conn)
+                assert res.state == SchemaState.UNKNOWN, (
+                    f"Expected UNKNOWN for unmanaged {table_name}.{col_name} UUID on PG, got {res.state}"
+                )
+
+            # Mode B: Managed 0005 schema with invalid native UUID on non-ID column
+            with sync_engine.begin() as conn:
+                conn.execute(
+                    sa.text(
+                        "CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY);"
+                    )
+                )
+                conn.execute(
+                    sa.text(
+                        "INSERT INTO alembic_version (version_num) VALUES ('0005_add_session_cred_version');"
+                    )
+                )
+
+            with sync_engine.connect() as conn:
+                res = inspect_legacy_schema(conn)
+                assert res.state == SchemaState.UNKNOWN, (
+                    f"Expected UNKNOWN for managed {table_name}.{col_name} UUID on PG, got {res.state}"
+                )
+
+        # Clean schema and upgrade back to head
+        with sync_engine.begin() as conn:
+            conn.execute(sa.text("DROP SCHEMA public CASCADE; CREATE SCHEMA public;"))
+        command.upgrade(alembic_cfg, "head")
+        command.check(alembic_cfg)
+    finally:
+        sync_engine.dispose()
 
 
 @pytest.mark.skipif(
@@ -18,8 +149,7 @@ POSTGRES_URL = os.environ.get("TEST_POSTGRES_URL")
 )
 @pytest.mark.asyncio
 async def test_postgres_migration_and_cas_concurrency():
-    """Verify PostgreSQL migrations to head with zero drift and physical concurrent CAS updates."""
-    # Convert asyncpg url to synchronous psycopg v3 driver for Alembic
+    """Verify PostgreSQL migrations, populated 0004->0005 backfill, CAS concurrency, and 3-connection lock orderings."""
     sync_pg_url = (
         POSTGRES_URL.replace("postgresql+asyncpg://", "postgresql+psycopg://")
         if "+asyncpg" in POSTGRES_URL
@@ -27,11 +157,56 @@ async def test_postgres_migration_and_cas_concurrency():
     )
 
     alembic_cfg = get_alembic_config(sync_pg_url)
+
+    # 1. Upgrade populated 0004 -> 0005 on PostgreSQL
+    command.downgrade(alembic_cfg, "base")
+    command.upgrade(alembic_cfg, "0004_add_credential_version")
+
+    sync_engine = sa.create_engine(sync_pg_url)
+    user_pop1 = uuid.uuid4()
+    user_pop2 = uuid.uuid4()
+    now_utc = datetime.now(timezone.utc)
+    with sync_engine.begin() as conn:
+        conn.execute(
+            sa.text(
+                "INSERT INTO users (id, is_active, is_superuser, created_at, updated_at) "
+                "VALUES (:u1, true, false, :now, :now), (:u2, true, false, :now, :now)"
+            ),
+            {"u1": user_pop1, "u2": user_pop2, "now": now_utc},
+        )
+        conn.execute(
+            sa.text(
+                "INSERT INTO password_credentials (id, user_id, hashed_password, credential_version, password_updated_at, created_at, updated_at) "
+                "VALUES (:cid, :u1, 'pg_hash', 3, :now, :now, :now)"
+            ),
+            {"cid": uuid.uuid4(), "u1": user_pop1, "now": now_utc},
+        )
+        conn.execute(
+            sa.text(
+                "INSERT INTO sessions (id, user_id, created_at, expires_at) "
+                "VALUES ('pg_sess1', :u1, :now, :now), ('pg_sess2', :u2, :now, :now)"
+            ),
+            {"u1": user_pop1, "u2": user_pop2, "now": now_utc},
+        )
+
+    # Upgrade to head (0005) on PostgreSQL
     command.upgrade(alembic_cfg, "head")
     command.check(alembic_cfg)
 
-    # Test physical concurrent CAS with separate async connections
-    engine = create_async_engine(POSTGRES_URL, echo=False)
+    with sync_engine.connect() as conn:
+        v1 = conn.execute(
+            sa.text("SELECT credential_version FROM sessions WHERE id = 'pg_sess1'")
+        ).scalar()
+        v2 = conn.execute(
+            sa.text("SELECT credential_version FROM sessions WHERE id = 'pg_sess2'")
+        ).scalar()
+        assert v1 == 3
+        assert v2 == 1
+
+    sync_engine.dispose()
+
+    # 2. Test physical concurrent CAS with separate async connections
+    engine: AsyncEngine = create_async_engine(POSTGRES_URL, echo=False)
     try:
         session_maker = async_sessionmaker(
             bind=engine, class_=AsyncSession, expire_on_commit=False
@@ -83,10 +258,10 @@ async def test_postgres_migration_and_cas_concurrency():
             assert cred.hashed_password == winner_hash
 
         # ---------------------------------------------------------
-        # Deterministic PostgreSQL Multi-Connection Concurrency Tests
+        # Deterministic 3-Connection PostgreSQL Concurrency Tests
         # ---------------------------------------------------------
 
-        # Ordering 1: Session issuance acquires lock first, Reset waits on row lock
+        # Ordering 1: Session issuance acquires lock first via adapter, Reset waits on row lock
         async with session_maker() as s_init:
             user1, _ = await adapter.create_user_with_password(
                 session=s_init,
@@ -97,93 +272,80 @@ async def test_postgres_migration_and_cas_concurrency():
             await s_init.commit()
             user1_id = user1.id
 
-        barrier_sess_locked = asyncio.Event()
-        barrier_reset_started = asyncio.Event()
+        barrier_issuance_ready = asyncio.Event()
+        raw_tok1 = "pg_raw_tok_ordering_1"
+        tok1_id = hash_token(raw_tok1)
 
-        async def worker_sess_creation() -> tuple[bool, str]:
-            raw_tok = "pg_raw_tok_ordering_1"
-            async with session_maker() as s1:
-                try:
-                    # 1. Acquire row lock on credentials for expected_credential_version=1
-                    cred_lock = (
-                        (
-                            await s1.execute(
-                                sa.select(adapter.credential_model)
-                                .where(
-                                    adapter.credential_model.user_id == user1_id,
-                                    adapter.credential_model.credential_version == 1,
-                                )
-                                .with_for_update()
-                            )
-                        )
-                        .scalars()
-                        .first()
-                    )
-                    assert cred_lock is not None
-                    barrier_sess_locked.set()
+        async with (
+            session_maker() as s_issuance,
+            session_maker() as s_reset,
+            session_maker() as s_observer,
+        ):
+            pid_issuance = (
+                await s_issuance.execute(sa.text("SELECT pg_backend_pid()"))
+            ).scalar()
+            pid_reset = (
+                await s_reset.execute(sa.text("SELECT pg_backend_pid()"))
+            ).scalar()
+            assert pid_issuance is not None and pid_reset is not None
 
-                    # Wait until reset worker has entered and is waiting
-                    await asyncio.wait_for(barrier_reset_started.wait(), timeout=5.0)
-                    await asyncio.sleep(
-                        0.1
-                    )  # Brief pause to ensure reset UPDATE is queued on row lock
+            # Worker 1 calls adapter.create_session (which acquires row lock on password_credentials)
+            sess_rec = await adapter.create_session(
+                session=s_issuance,
+                user_id=user1_id,
+                raw_token=raw_tok1,
+                expected_credential_version=1,
+            )
+            assert sess_rec.credential_version == 1
+            barrier_issuance_ready.set()
 
-                    # Complete session insertion and commit
-                    sess_rec = await adapter.create_session(
-                        session=s1,
-                        user_id=user1_id,
-                        raw_token=raw_tok,
-                        expected_credential_version=1,
-                    )
-                    await s1.commit()
-                    assert sess_rec.credential_version == 1
-                    return True, raw_tok
-                except Exception:
-                    await s1.rollback()
-                    raise
+            # Worker 2 starts adapter.atomic_reset_password concurrently (which blocks on Worker 1's lock)
+            async def run_reset_worker():
+                return await adapter.atomic_reset_password(
+                    session=s_reset,
+                    user_id=user1_id,
+                    expected_cred_v=1,
+                    new_hashed_password="$argon2id$newpass1",
+                )
 
-        async def worker_reset_password() -> bool:
-            async with session_maker() as s2:
-                try:
-                    await asyncio.wait_for(barrier_sess_locked.wait(), timeout=5.0)
-                    barrier_reset_started.set()
-                    # atomic_reset_password will block until worker_sess_creation commits and releases row lock
-                    ok = await asyncio.wait_for(
-                        adapter.atomic_reset_password(
-                            session=s2,
-                            user_id=user1_id,
-                            expected_cred_v=1,
-                            new_hashed_password="$argon2id$newpass1",
-                        ),
-                        timeout=5.0,
-                    )
-                    if ok:
-                        await s2.commit()
-                    else:
-                        await s2.rollback()
-                    return ok
-                except Exception:
-                    await s2.rollback()
-                    raise
+            reset_task = asyncio.create_task(run_reset_worker())
 
-        sess_res, reset_ok = await asyncio.gather(
-            worker_sess_creation(),
-            worker_reset_password(),
-        )
-        assert sess_res[0] is True
-        assert reset_ok is True
-        issued_tok1 = sess_res[1]
+            # Observer confirms Worker 2 is physically blocked by Worker 1 in PostgreSQL
+            await wait_for_lock_block(
+                observer_session=s_observer,
+                waiter_pid=pid_reset,
+                blocker_pid=pid_issuance,
+                timeout=5.0,
+            )
 
-        # Verify post-reset authorization: issued session was bound to version 1, but credential is now version 2
-        async with session_maker() as s_check:
-            cred = await adapter.get_password_credential(s_check, user1_id)
-            assert cred is not None
-            assert cred.credential_version == 2
-            auth_res = await adapter.get_session_and_user(s_check, issued_tok1)
-            # MUST fail authentication (401 invalidation)
+            # Worker 1 commits session
+            await s_issuance.commit()
+
+            # Worker 2 unblocks, completes atomic_reset_password, and commits
+            reset_ok = await asyncio.wait_for(reset_task, timeout=5.0)
+            assert reset_ok is True
+            await s_reset.commit()
+
+            # Post-reset verification:
+            # 1. Physical revocation: user's session was deleted by atomic_reset_password
+            res_count = (
+                await s_observer.execute(
+                    sa.text("SELECT count(*) FROM sessions WHERE id = :tid"),
+                    {"tid": tok1_id},
+                )
+            ).scalar()
+            assert res_count == 0
+
+            # 2. Credential generation bumped to 2
+            cred1 = await adapter.get_password_credential(s_observer, user1_id)
+            assert cred1 is not None
+            assert cred1.credential_version == 2
+
+            # 3. Authorization rejected
+            auth_res = await adapter.get_session_and_user(s_observer, raw_tok1)
             assert auth_res is None
 
-        # Ordering 2: Reset acquires lock and commits first, Session creation observes version mismatch
+        # Ordering 2: Reset acquires lock first via adapter, Session creation waits on row lock
         async with session_maker() as s_init:
             user2, _ = await adapter.create_user_with_password(
                 session=s_init,
@@ -194,34 +356,80 @@ async def test_postgres_migration_and_cas_concurrency():
             await s_init.commit()
             user2_id = user2.id
 
-        # Reset advances credential_version from 1 to 2 first
-        async with session_maker() as s_reset:
-            ok2 = await adapter.atomic_reset_password(
+        raw_tok2 = "pg_raw_tok_ordering_2"
+        tok2_id = hash_token(raw_tok2)
+        barrier_reset_ready = asyncio.Event()
+
+        async with (
+            session_maker() as s_issuance,
+            session_maker() as s_reset,
+            session_maker() as s_observer,
+        ):
+            pid_issuance = (
+                await s_issuance.execute(sa.text("SELECT pg_backend_pid()"))
+            ).scalar()
+            pid_reset = (
+                await s_reset.execute(sa.text("SELECT pg_backend_pid()"))
+            ).scalar()
+            assert pid_issuance is not None and pid_reset is not None
+
+            # Worker 2 calls adapter.atomic_reset_password (holds row exclusive lock on password_credentials)
+            reset_ok2 = await adapter.atomic_reset_password(
                 session=s_reset,
                 user_id=user2_id,
                 expected_cred_v=1,
                 new_hashed_password="$argon2id$newpass2",
             )
-            assert ok2 is True
-            await s_reset.commit()
+            assert reset_ok2 is True
+            barrier_reset_ready.set()
 
-        # Session creation attempted with stale expected_credential_version=1 MUST raise ValueError
-        async with session_maker() as s_sess:
-            with pytest.raises(
-                ValueError, match="Credential version mismatch during session creation"
-            ):
-                await adapter.create_session(
-                    session=s_sess,
+            # Worker 1 attempts adapter.create_session with expected_credential_version=1 (blocks on Worker 2's lock)
+            async def run_issuance_worker():
+                return await adapter.create_session(
+                    session=s_issuance,
                     user_id=user2_id,
-                    raw_token="pg_stale_token_attempt",
+                    raw_token=raw_tok2,
                     expected_credential_version=1,
                 )
 
-        # Verify no session was created and authentication returns None
-        async with session_maker() as s_check:
-            auth_res2 = await adapter.get_session_and_user(
-                s_check, "pg_stale_token_attempt"
+            issuance_task = asyncio.create_task(run_issuance_worker())
+
+            # Observer confirms Worker 1 is physically blocked by Worker 2 in PostgreSQL
+            await wait_for_lock_block(
+                observer_session=s_observer,
+                waiter_pid=pid_issuance,
+                blocker_pid=pid_reset,
+                timeout=5.0,
             )
+
+            # Worker 2 commits (advancing version to 2)
+            await s_reset.commit()
+
+            # Worker 1 unblocks, observes version mismatch (version is now 2), and raises ValueError
+            with pytest.raises(
+                ValueError, match="Credential version mismatch during session creation"
+            ):
+                await asyncio.wait_for(issuance_task, timeout=5.0)
+
+            await s_issuance.rollback()
+
+            # Post-reset verification:
+            # 1. No session was inserted
+            res_count2 = (
+                await s_observer.execute(
+                    sa.text("SELECT count(*) FROM sessions WHERE id = :tid"),
+                    {"tid": tok2_id},
+                )
+            ).scalar()
+            assert res_count2 == 0
+
+            # 2. Credential generation bumped to 2
+            cred2 = await adapter.get_password_credential(s_observer, user2_id)
+            assert cred2 is not None
+            assert cred2.credential_version == 2
+
+            # 3. Authorization rejected
+            auth_res2 = await adapter.get_session_and_user(s_observer, raw_tok2)
             assert auth_res2 is None
 
         # Verify complete downgrade to base and re-upgrade to head

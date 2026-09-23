@@ -58,6 +58,28 @@ async def async_inspect_legacy_schema(
     return await _async_inspect(connection)
 
 
+def normalize_legacy_revision(connection: Connection) -> bool:
+    """Normalize legacy 35-character revision '0005_add_session_credential_version' to '0005_add_session_cred_version'.
+
+    Executes within the connection's active transaction context.
+    Returns True if a legacy revision row was updated, False otherwise.
+    """
+    import sqlalchemy as sa
+
+    inspector = sa.inspect(connection)
+    if "alembic_version" not in inspector.get_table_names():
+        return False
+    res = connection.execute(
+        sa.text(
+            "UPDATE alembic_version "
+            "SET version_num = '0005_add_session_cred_version' "
+            "WHERE version_num = '0005_add_session_credential_version'"
+        )
+    )
+    count = res.rowcount if hasattr(res, "rowcount") else 0
+    return bool(count and count > 0)
+
+
 __all__ = [
     "SchemaInspectionResult",
     "SchemaState",
@@ -65,4 +87,5 @@ __all__ = [
     "get_alembic_config",
     "get_migrations_directory",
     "inspect_legacy_schema",
+    "normalize_legacy_revision",
 ]
