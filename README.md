@@ -1,71 +1,54 @@
 # FastAPI Accounts ⚡
 
-*Modern, zero-boilerplate authentication and account management for FastAPI.*
+FastAPI Accounts provides email/password account management and database-backed sessions for FastAPI. It includes registration, email verification, login/logout, password reset/change, cookie or bearer transport, and dependencies for protecting routes. It uses async SQLAlchemy for persistence; applications supply email delivery and their frontend.
 
-[![PyPI](https://img.shields.io/pypi/v/fastapi-accounts?color=brightgreen&label=PyPI)](https://pypi.org/project/fastapi-accounts)
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/fastapi-accounts/fastapi-accounts/blob/main/LICENSE)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.110%2B-009688.svg?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
-[![Pydantic v2](https://img.shields.io/badge/Pydantic-v2-E92063.svg?logo=pydantic&logoColor=white)](https://pydantic.dev)
-[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB.svg?logo=python&logoColor=white)](https://www.python.org)
-[![Discussions](https://img.shields.io/badge/Community-Discussions-brightgreen.svg)](https://github.com/fastapi-accounts/fastapi-accounts/discussions)
+Status: alpha. Review the compatibility, migration and deployment guidance before adopting it.
 
 ---
 
-## 💡 The Vision
+## Supported Capabilities and Boundaries
 
-Django developers have `django-allauth`.  
-TypeScript developers have `Better-Auth` and `Lucia`.  
-**FastAPI developers deserve a modern, batteries-included authentication and account management engine.**
+**Capabilities:**
+* **Account Management:** Email/password registration, login, logout, and authenticated password changes.
+* **Email Verification:** Issuance of verification tokens; applications supply the delivery callback and frontend flow.
+* **Password Resets:** Issuance of secure reset tokens; applications supply the delivery callback.
+* **Transports:** Cookie transport (for SPAs/web) and Bearer transport (for mobile/APIs).
+* **Route Protection:** Dependency injection (`current_active_user`, `current_superuser`) returning immutable DTOs.
+* **Database Integration:** Async SQLAlchemy 2.0 with default models and packaged Alembic migrations.
 
-Today, building authentication in FastAPI usually means either:
-1. **Writing 1,000+ lines of custom boilerplate** (Argon2 hashing, JWT/token issuance, password reset tokens, email verification, OAuth state handling) for every new project.
-2. **Wrestling with complex generic typing and multi-file wiring** in older libraries that are now in maintenance mode.
-3. **Paying steep monthly fees** to vendor-locked cloud auth providers (Clerk, Auth0).
-
-**FastAPI Accounts** provides a modular, security-focused authentication and account management engine built for **FastAPI**, **Pydantic v2**, and **Async SQLAlchemy 2.0**.
-
-📖 *Read our full story: [**The Journey of FastAPI Accounts (JOURNEY.md)**](JOURNEY.md).*
-
----
-
-## ✨ Key Capabilities
-
-* **⚡ Minimal Setup:** Core authentication and account endpoints mounted with a single router and sensible defaults.
-* **🍪 Dual-Transport Architecture:**
-  * **Cookie Transport (Web & SPAs):** `HttpOnly` `SameSite=Lax` session cookies with `Secure=True` by default.
-  * **Bearer Transport (Mobile & CLI):** `Authorization: Bearer <token>` token transport.
-* **🛡️ Security-First Primitives:**
-  * **Async Offloaded Argon2id:** Hashing and verification run off the event loop via worker threads with configurable `CapacityLimiter`.
-  * **Timing Oracle Equalization:** Missing users execute dummy hash verification to prevent response-time enumeration.
-  * **Monotonic Credential Versioning:** Database check-constrained `credential_version >= 1` with atomic Compare-And-Swap (CAS) to guarantee single-use reset tokens even under frozen or skewed system clocks.
-  * **Session-Bound CSRF Protection:** Signed double-submit CSRF tokens and strict `Origin`/`Referer` validation against untrusted or sibling origins.
-  * **PII-Safe Rate Limiting:** Built-in sliding-window limiter with HMAC-hashed identity keys protecting sensitive authentication flows.
-  * **Session Revocation:** Invalidation of existing sessions upon password reset or change.
-  * **Response DTO Whitelisting:** Strict serialization returning immutable `UserPrincipal` DTOs.
-  * **Sanitized Logging:** Zero raw security tokens or credential material in stdout/stderr/logs.
-* **🗄️ Database & Schema Management:**
-  * Async SQLAlchemy 2.0 with type-annotated declarative mixins.
-  * Request-scoped session dependency injection honoring `app.dependency_overrides`.
-  * Packaged Alembic migrations for default models with deterministic upgrade and adoption paths.
+**Boundaries (Not Currently Provided):**
+FastAPI Accounts focuses strictly on email/password flows. It **does not** provide:
+* OAuth / OpenID Connect (Social Logins)
+* Multi-Factor Authentication (MFA)
+* Passkeys / WebAuthn
+* General-purpose Role-Based Access Control (RBAC) or granular permissions
 
 ---
 
-## 🚀 Quickstart
+## Installation
 
-### 1. Installation
-
+Install via pip:
 ```bash
-# Install with SQLite driver:
-pip install "fastapi-accounts[sqlite]" --pre
-
-# Or install with PostgreSQL driver and Alembic migrations:
-pip install "fastapi-accounts[postgres,migrations]" --pre
-
-# Or with uv:
-uv add "fastapi-accounts[sqlite]" --prerelease=allow
+pip install fastapi-accounts
 ```
 
-### 2. Basic Application (`app.py`)
+To include the PostgreSQL driver and packaged Alembic migrations, install with the `postgres` and `migrations` extras:
+```bash
+pip install "fastapi-accounts[postgres,migrations]"
+```
+
+---
+
+## Quickstart
+
+Get a complete, working authentication API running locally with a disposable SQLite database.
+
+First, generate a secure secret key and expose it as an environment variable:
+```bash
+export FASTAPI_ACCOUNTS_SECRET_KEY=$(openssl rand -hex 32)
+```
+
+Create `main.py`:
 
 ```python
 import os
@@ -78,137 +61,106 @@ from fastapi_accounts import (
     UserPrincipal,
 )
 
-# 1. Initialize adapter & account engine
-# In production, provide a secret key representing at least 256 bits of entropy:
-# $ export FASTAPI_ACCOUNTS_SECRET_KEY=$(openssl rand -hex 32)
 adapter = SQLAlchemyAdapter(database_url="sqlite+aiosqlite:///./accounts.db")
 accounts = FastAPIAccounts(
     adapter=adapter,
     secret_key=os.environ["FASTAPI_ACCOUNTS_SECRET_KEY"],
-    # For local development without HTTPS, set cookie_secure=False:
+    # For local HTTP development, set cookie_secure=False:
     transport=CookieTransport(cookie_secure=False),
 )
 
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Automatically create database tables on startup (for dev/quickstart)
+    # Automatically create tables on startup (recommended for disposable development)
     await adapter.create_all()
     yield
 
-
-# 2. Mount all auth & account endpoints in one line
 app = FastAPI(title="My API", lifespan=lifespan)
 app.include_router(accounts.router, prefix="/api/v1/auth", tags=["Auth"])
 
-
-# 3. Protect any endpoint with clean dependency injection returning UserPrincipal DTO
 @app.get("/api/v1/profile")
 async def get_profile(user: UserPrincipal = Depends(accounts.current_active_user)):
-    return {"message": f"Welcome back, {user.email}!", "user_id": user.id}
+    return {"message": f"Welcome, {user.email}!", "user_id": str(user.id)}
+```
+
+Run with Uvicorn:
+```bash
+uvicorn main:app --reload
 ```
 
 ---
 
-## 🗄️ Database Migrations & Legacy Adoption
+## Cookie versus Bearer Behavior
 
-FastAPI Accounts includes packaged Alembic migrations for its default declarative models.
+Cookie and bearer transports use the same database-backed sessions. Bearer access tokens are opaque session credentials, not JWTs.
 
-### Programmatic Migration Execution
+Logging out immediately revokes the session in the database. Password resets invalidate existing sessions and previously issued reset challenges.
+
+---
+
+## Email Verification and Reset Delivery
+
+Your application supplies email delivery through callbacks. FastAPI Accounts generates verification and reset tokens; your callback delivers the corresponding link to the user.
+
+Without a callback, the library simply logs a notification event and returns. You must hook into `on_after_request_password_reset` or `on_after_register` to dispatch the emails.
+
+For a complete example showing token delivery, frontend URL construction and callback-failure handling, see [examples/basic_app.py](examples/basic_app.py).
+
+---
+
+## Essential Configuration and Deployment Limits
+
+FastAPI Accounts uses the following secure defaults and limits out of the box:
+
+| Setting | Default Value | Description |
+|---|---|---|
+| **Email verification before login** | Disabled | Users can log in immediately without verifying their email. |
+| **Session lifetime** | 14 days | Active sessions expire after two weeks. |
+| **Password-reset token lifetime** | 15 minutes | Reset links expire quickly to limit exposure. |
+| **Cookie protections** | `HttpOnly`, `SameSite=Lax`, `Secure=True` | Secure by default; requires explicit `cookie_secure=False` for local HTTP development. |
+| **Rate limiting** | Enabled (in-memory) | Enabled by default, but currently limited to a **single process**. |
+| **Email delivery** | Application-supplied | The library generates tokens; you provide the delivery callback. |
+
+---
+
+## Database Migrations and Customization
+
+Use `create_all()` for a disposable development database. Use packaged migrations for managed deployments. Install the migrations extra and follow the migration guide.
 
 ```python
 from alembic import command
 from fastapi_accounts.migrations import get_alembic_config
 
-# Point Alembic directly to packaged migrations
-config = get_alembic_config("sqlite:///./accounts.db")
+config = get_alembic_config("postgresql+asyncpg://user:pass@localhost/dbname")
 command.upgrade(config, "head")
 ```
 
-### CLI Configuration (`alembic.ini`)
-
-You can reference the packaged migrations directly in your `alembic.ini`:
-
-```ini
-[alembic]
-script_location = fastapi_accounts:migrations
-sqlalchemy.url = sqlite:///./accounts.db
-```
-
-Or provide your database URL via environment variable:
-```bash
-export FASTAPI_ACCOUNTS_DATABASE_URL="sqlite:///./accounts.db"
-alembic upgrade head
-alembic check
-```
-
-> [!NOTE]
-> Bundled migrations manage the library's default declarative models. Applications implementing custom model classes and table names should manage those schemas within their own Alembic environment.
-
-### Safe Legacy Database Upgrade Workflow
-
-If upgrading an existing database initialized with `v0.1.0a2`, `v0.1.0a3`, or `v0.1.0a4` using `adapter.create_all()`:
-
-1. **Back up your database** prior to executing schema commands.
-2. **Inspect your schema** to verify compatibility:
-   ```python
-   from sqlalchemy import create_engine
-   from fastapi_accounts.migrations import inspect_legacy_schema, SchemaState
-
-   engine = create_engine("sqlite:///./accounts.db")
-   with engine.connect() as conn:
-       result = inspect_legacy_schema(conn)
-       print(f"Detected schema state: {result.state.value}")
-   ```
-3. **Apply the appropriate migration path:**
-   * **If `ALEMBIC_MANAGED`** (database is already tracked by Alembic):
-     ```bash
-     alembic upgrade head
-     ```
-   * **If `UNVERSIONED_CURRENT`** (unmanaged schema with `password_credentials.credential_version` and `sessions.credential_version`):
-     ```bash
-     alembic stamp 0005_add_session_cred_version
-     alembic upgrade head
-     ```
-   * **If `UNVERSIONED_A4`** (unmanaged schema containing `password_credentials.credential_version` but lacking `sessions.credential_version`):
-     ```bash
-     alembic stamp 0004_add_credential_version
-     alembic upgrade head
-     ```
-   * **If `UNVERSIONED_A3`** (unmanaged schema containing `password_updated_at` and indexes):
-     ```bash
-     alembic stamp 0003_add_session_indexes
-     alembic upgrade head
-     ```
-   * **If `UNVERSIONED_A2`** (unmanaged baseline lacking `password_updated_at` column):
-     ```bash
-     alembic stamp 0001_initial_schema
-     alembic upgrade head
-     ```
-   * **If `UNKNOWN`:** Do not stamp; inspect your database schema for custom modifications or structural discrepancies.
-
-> [!IMPORTANT]
-> **Custom Model Notice (0.1.0a5 Upgrade):**  
-> If defining custom session models, your `Session` model must inherit from `SessionMixin` or declare `credential_version: Mapped[int] = mapped_column(sa.Integer, default=1, nullable=False)` with check constraint `credential_version >= 1`.
-
+**Further Documentation:**
+* [Database Migrations (docs/migrations.md)](docs/migrations.md) — For legacy stamping, custom-model migration ownership, and recovery procedures.
+* [The Journey of FastAPI Accounts (JOURNEY.md)](JOURNEY.md) — For our ecosystem vision and design rationale.
 
 ---
 
-## 🧪 Running Tests
+## Development, Security, and License
 
-FastAPI Accounts comes with a comprehensive automated test suite:
-
+### Contributions & Testing
+To run the test suite, install the development dependencies:
 ```bash
-# Clone the repository
 git clone https://github.com/fastapi-accounts/fastapi-accounts.git
 cd fastapi-accounts
+pip install -e ".[dev]"
+```
 
-# Run tests with pytest
+PostgreSQL integration tests require a disposable test database explicitly exported:
+```bash
+export TEST_POSTGRES_URL="postgresql+asyncpg://user:pass@localhost/test_db"
 pytest -v
 ```
 
----
+### Security
+The library uses dummy password verification to reduce timing differences and restricts sensitive endpoints with rate limiting. Library-generated logging excludes credentials and raw authentication tokens. Application callbacks, middleware, and proxies remain outside that guarantee.
 
-## 📄 License
+For vulnerability reporting and our security policy, please read [SECURITY.md](SECURITY.md).
 
-FastAPI Accounts is open-source software licensed under the [Apache License 2.0](LICENSE).
+### License
+FastAPI Accounts is licensed under the [Apache License 2.0](LICENSE).

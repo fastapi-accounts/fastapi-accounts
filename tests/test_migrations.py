@@ -859,6 +859,46 @@ def test_env_py_loads_database_url_from_env(monkeypatch: pytest.MonkeyPatch):
         command.check(alembic_cfg)
 
 
+def test_alembic_ini_minimal_without_logging_sections():
+    """Verify that running alembic with a minimal alembic.ini lacking logging sections succeeds without KeyError."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = os.path.join(tmpdir, "minimal_ini.db")
+        sync_db_url = f"sqlite:///{db_path}"
+        ini_path = os.path.join(tmpdir, "alembic.ini")
+        with open(ini_path, "w") as f:
+            f.write(
+                f"[alembic]\n"
+                f"script_location = fastapi_accounts:migrations\n"
+                f"sqlalchemy.url = {sync_db_url}\n"
+            )
+        from alembic.config import Config
+
+        cfg = Config(ini_path)
+        command.upgrade(cfg, "head")
+        command.check(cfg)
+
+
+def test_alembic_ini_malformed_logging_sections_fails():
+    """Verify that an ini with [loggers] but missing required [formatters] raises a clear KeyError."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = os.path.join(tmpdir, "malformed_ini.db")
+        sync_db_url = f"sqlite:///{db_path}"
+        ini_path = os.path.join(tmpdir, "alembic.ini")
+        with open(ini_path, "w") as f:
+            f.write(
+                f"[alembic]\n"
+                f"script_location = fastapi_accounts:migrations\n"
+                f"sqlalchemy.url = {sync_db_url}\n"
+                f"[loggers]\n"
+                f"keys = root\n"
+            )
+        from alembic.config import Config
+
+        cfg = Config(ini_path)
+        with pytest.raises(KeyError):
+            command.upgrade(cfg, "head")
+
+
 def test_migration_0004_rejects_pre_existing_drift():
     """Verify that upgrading a managed database from 0003 to 0004 fails closed if credential_version column already exists."""
     with tempfile.TemporaryDirectory() as tmpdir:
