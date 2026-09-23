@@ -1,8 +1,11 @@
-from typing import Literal
+import warnings
+from typing import Any, Literal
 
 from fastapi import Request, Response
 
 from fastapi_accounts.transports.base import BaseTransport
+
+_UNSET = object()
 
 
 class CookieTransport(BaseTransport):
@@ -12,7 +15,7 @@ class CookieTransport(BaseTransport):
         self,
         cookie_name: str = "fastapi_accounts_session",
         csrf_cookie_name: str = "fastapi_accounts_csrf",
-        max_age: int = 86400 * 14,  # 14 days
+        max_age: Any = _UNSET,
         path: str = "/",
         domain: str | None = None,
         cookie_secure: bool = True,
@@ -22,7 +25,16 @@ class CookieTransport(BaseTransport):
     ):
         self.cookie_name = cookie_name
         self.csrf_cookie_name = csrf_cookie_name
-        self.max_age = max_age
+
+        if max_age is not _UNSET:
+            warnings.warn(
+                "CookieTransport(max_age=...) is deprecated. "
+                "Configure FastAPIAccounts(session_max_age_seconds=...) instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
+        self.max_age = 86400 * 14 if max_age is _UNSET else max_age
         self.path = path
         self.domain = domain
         self.cookie_secure = cookie_secure

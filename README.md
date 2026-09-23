@@ -69,14 +69,17 @@ accounts = FastAPIAccounts(
     transport=CookieTransport(cookie_secure=False),
 )
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Automatically create tables on startup (recommended for disposable development)
     await adapter.create_all()
     yield
 
+
 app = FastAPI(title="My API", lifespan=lifespan)
 app.include_router(accounts.router, prefix="/api/v1/auth", tags=["Auth"])
+
 
 @app.get("/api/v1/profile")
 async def get_profile(user: UserPrincipal = Depends(accounts.current_active_user)):

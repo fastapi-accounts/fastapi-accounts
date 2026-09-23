@@ -45,8 +45,14 @@ async def test_cookie_transport_vertical_slice(cookie_accounts: FastAPIAccounts)
         assert req_verify_resp.status_code == 200
 
         # 4. Verify email with token
+        async with cookie_accounts.adapter.session_maker() as session:
+            user = await cookie_accounts.adapter.get_user_by_email(
+                session, "alice@example.com"
+            )
+            email_id = user.emails[0].id
+
         token = cookie_accounts.service.generate_email_verification_token(
-            "alice@example.com"
+            user.id, email_id, "alice@example.com"
         )
         verify_resp = await client.post(
             "/api/v1/auth/verify-email",

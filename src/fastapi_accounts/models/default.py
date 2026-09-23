@@ -28,7 +28,7 @@ class User(Base, UserMixin):
         back_populates="user",
         uselist=False,
         cascade="all, delete-orphan",
-        lazy="selectin",
+        lazy="raise",
     )
     sessions: Mapped[list["Session"]] = relationship(
         "Session", back_populates="user", cascade="all, delete-orphan"

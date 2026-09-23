@@ -47,8 +47,9 @@ async def test_migration_fresh_database():
         async with adapter.session_maker() as session:
             queried = await adapter.get_user_by_email(session, "fresh@example.com")
             assert queried is not None
-            assert queried.password_credential is not None
-            assert queried.password_credential.credential_version == 1
+            cred = await adapter.get_password_credential(session, queried.id)
+            assert cred is not None
+            assert cred.credential_version == 1
 
         await adapter.engine.dispose()
 

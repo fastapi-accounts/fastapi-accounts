@@ -21,11 +21,19 @@ if not secret_key:
     )
 
 adapter = SQLAlchemyAdapter(database_url="sqlite+aiosqlite:///./example_accounts.db")
+
+async def mock_delivery_hook(user: UserPrincipal, token: str, request) -> None:
+    # In a real application, email the token to user.email
+    # Do not log or print the token or secret-bearing URL in production!
+    print(f"[Mock Email] Sent link to {user.email}")
+
 accounts = FastAPIAccounts(
     adapter=adapter,
     secret_key=secret_key,
     # Note: cookie_secure=False is used here for plain HTTP local testing. In production, leave cookie_secure=True (default).
     transport=CookieTransport(cookie_secure=False),
+    on_after_register=mock_delivery_hook,
+    on_after_request_password_reset=mock_delivery_hook,
 )
 
 

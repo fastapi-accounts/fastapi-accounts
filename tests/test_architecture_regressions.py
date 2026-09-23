@@ -35,7 +35,10 @@ async def test_a01_commit_before_response_guarantee(cookie_accounts: FastAPIAcco
                 session, "a01_commit@example.com"
             )
             assert user is not None
-            assert user.password_credential is not None
+            cred = await cookie_accounts.adapter.get_password_credential(
+                session, user.id
+            )
+            assert cred is not None
 
 
 @pytest.mark.asyncio
@@ -98,8 +101,14 @@ async def test_a01_injected_commit_failure_verify_email(
         )
         assert reg_resp.status_code == 201
 
+        async with cookie_accounts.adapter.session_maker() as session:
+            user = await cookie_accounts.adapter.get_user_by_email(
+                session, "unverified@example.com"
+            )
+            email_id = user.emails[0].id
+
         token = cookie_accounts.service.generate_email_verification_token(
-            "unverified@example.com"
+            user.id, email_id, "unverified@example.com"
         )
 
         # Inject commit failure

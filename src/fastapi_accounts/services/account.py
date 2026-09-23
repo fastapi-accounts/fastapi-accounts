@@ -114,9 +114,17 @@ class AccountService:
                         type(hook_exc).__name__,
                     )
 
-    def generate_email_verification_token(self, email: str) -> str:
+    def generate_email_verification_token(
+        self, user_id: uuid.UUID, email_id: uuid.UUID, email: str
+    ) -> str:
         return self.token_signer.create_token(
-            {"email": email.strip().lower(), "action": "verify_email"}
+            {
+                "sub": str(user_id),
+                "email_id": str(email_id),
+                "email": email.strip().lower(),
+                "action": "verify_email",
+                "token_v": 2,
+            }
         )
 
     def generate_password_reset_token(
@@ -162,7 +170,9 @@ class AccountService:
             await session.rollback()
             raise
 
-        token = self.generate_email_verification_token(clean_email)
+        token = self.generate_email_verification_token(
+            user.id, email_rec.id, clean_email
+        )
         await self._invoke_callback_safely(
             self.on_after_register, "register", principal, token
         )
@@ -222,7 +232,9 @@ class AccountService:
                     principal = _to_principal(
                         user, clean_email, is_verified=False, email_record=email_rec
                     )
-                    token = self.generate_email_verification_token(clean_email)
+                    token = self.generate_email_verification_token(
+                        user.id, email_rec.id, clean_email
+                    )
                     await self._invoke_callback_safely(
                         self.on_after_register, "request_verify_email", principal, token
                     )
@@ -350,26 +362,42 @@ class AccountService:
         if not payload or payload.get("action") != "verify_email":
             return None
 
+        if payload.get("token_v") != 2:
+            return None
+
         if key_kind == KeyKind.RAW_FALLBACK and not self.allow_legacy_tokens:
             return None
 
         email = payload.get("email")
-        if not email:
+        sub_str = payload.get("sub")
+        email_id_str = payload.get("email_id")
+
+        if not email or not sub_str or not email_id_str:
             return None
 
         try:
-            email_rec = await self.store.verify_email(session, email)
+            user_id = uuid.UUID(sub_str)
+            email_id = uuid.UUID(email_id_str)
+        except ValueError:
+            return None
+
+        try:
+            email_rec = await self.store.verify_email(session, email_id, user_id, email)
             if not email_rec:
                 await session.rollback()
                 return None
-            await session.commit()
 
             user = await self.store.get_user_by_id(session, email_rec.user_id)
             if not user:
+                await session.rollback()
                 return None
-            return _to_principal(
+
+            principal = _to_principal(
                 user, email_rec.email, is_verified=True, email_record=email_rec
             )
+
+            await session.commit()
+            return principal
         except Exception:
             await session.rollback()
             raise

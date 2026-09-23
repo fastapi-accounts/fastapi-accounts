@@ -149,18 +149,25 @@ class SQLAlchemyAdapter:
         return user, email_record
 
     async def verify_email(
-        self, session: AsyncSession, email: str
+        self, session: AsyncSession, email_id: uuid.UUID, user_id: uuid.UUID, email: str
     ) -> EmailAddress | None:
-        """Mark an email address as verified."""
+        """Mark an email address as verified using atomic compare-and-swap."""
         clean_email = email.strip().lower()
-        stmt = select(self.email_model).where(self.email_model.email == clean_email)
+        stmt = (
+            update(self.email_model)
+            .where(
+                self.email_model.id == email_id,
+                self.email_model.user_id == user_id,
+                self.email_model.email == clean_email,
+                self.email_model.is_verified == False,
+            )
+            .values(is_verified=True)
+            .returning(self.email_model)
+        )
         result = await session.execute(stmt)
         email_record = result.scalars().first()
         if not email_record:
             return None
-
-        email_record.is_verified = True
-        await session.flush()
         return email_record
 
     async def create_session(

@@ -6,7 +6,16 @@ from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    Request,
+    Response,
+    Security,
+    status,
+)
+from fastapi.security import APIKeyCookie, HTTPBearer
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -89,6 +98,7 @@ class FastAPIAccounts:
         verify_email_required: bool = False,
         session_max_age_seconds: int = 86400 * 14,
         reset_password_token_max_age_seconds: int = 900,
+        pre_auth_csrf_max_age_seconds: int = 3600,
         argon2_concurrency: int = 4,
         rate_limiter: BaseRateLimiter | None = None,
         allowed_origins: list[str] | None = None,
@@ -124,6 +134,10 @@ class FastAPIAccounts:
         self.verify_email_required = verify_email_required
         self.session_max_age_seconds = session_max_age_seconds
         self.reset_password_token_max_age_seconds = reset_password_token_max_age_seconds
+        self.pre_auth_csrf_max_age_seconds = pre_auth_csrf_max_age_seconds
+
+        if isinstance(self.transport, CookieTransport):
+            self.transport.max_age = self.session_max_age_seconds
         self.argon2_concurrency = argon2_concurrency
         self.allowed_origins = allowed_origins
         self.trusted_proxies = trusted_proxies
@@ -189,6 +203,18 @@ class FastAPIAccounts:
             superuser_required=True,
         )
 
+        # OpenAPI Authentication Scheme Integration
+        self.openapi_scheme_name = None
+        self.openapi_scheme_dependency = None
+        if isinstance(self.transport, CookieTransport):
+            self.openapi_scheme_name = "APIKeyCookie"
+            self.openapi_scheme_dependency = Security(
+                APIKeyCookie(name=self.transport.cookie_name, auto_error=False)
+            )
+        elif isinstance(self.transport, BearerTransport):
+            self.openapi_scheme_name = "HTTPBearer"
+            self.openapi_scheme_dependency = Security(HTTPBearer(auto_error=False))
+
         self.router = self._build_router()
 
     async def _enforce_rate_limit(
@@ -244,9 +270,18 @@ class FastAPIAccounts:
     def _build_router(self) -> APIRouter:
         router = APIRouter()
 
+        optional_openapi = {}
+        if self.openapi_scheme_name:
+            optional_openapi = {"security": [{self.openapi_scheme_name: []}, {}]}
+
+        req_deps = (
+            [self.openapi_scheme_dependency] if self.openapi_scheme_dependency else []
+        )
+
         @router.get(
             "/csrf",
             summary="Bootstrap pre-authentication or session CSRF token",
+            openapi_extra=optional_openapi,
         )
         async def get_csrf_token(
             request: Request,
@@ -263,13 +298,19 @@ class FastAPIAccounts:
             if session_info:
                 _principal, session_id = session_info
                 csrf_token = create_session_csrf_token(
-                    session_id, self.csrf_signing_key
+                    session_id, self.csrf_signing_key, self.session_max_age_seconds
                 )
+                cookie_max_age = self.session_max_age_seconds
             else:
-                csrf_token = create_pre_auth_csrf_token(self.csrf_signing_key)
+                csrf_token = create_pre_auth_csrf_token(
+                    self.csrf_signing_key, self.pre_auth_csrf_max_age_seconds
+                )
+                cookie_max_age = self.pre_auth_csrf_max_age_seconds
 
             if isinstance(self.transport, CookieTransport):
-                self.transport.set_csrf_cookie(response, csrf_token)
+                self.transport.set_csrf_cookie(
+                    response, csrf_token, max_age=cookie_max_age
+                )
             return {"csrf_token": csrf_token}
 
         @router.post(
@@ -317,6 +358,7 @@ class FastAPIAccounts:
         @router.post(
             "/verify-email",
             summary="Verify email address with verification token",
+            openapi_extra=optional_openapi,
         )
         async def verify_email(
             payload: EmailVerificationRequest,
@@ -400,6 +442,7 @@ class FastAPIAccounts:
         @router.post(
             "/reset-password",
             summary="Reset user password with a reset token",
+            openapi_extra=optional_openapi,
         )
         async def reset_password(
             payload: ResetPasswordRequest,
@@ -504,9 +547,11 @@ class FastAPIAccounts:
             if isinstance(self.transport, CookieTransport):
                 # Issue authenticated session-bound CSRF token
                 auth_csrf_token = create_session_csrf_token(
-                    session_id, self.csrf_signing_key
+                    session_id, self.csrf_signing_key, self.session_max_age_seconds
                 )
-                self.transport.set_csrf_cookie(response, auth_csrf_token)
+                self.transport.set_csrf_cookie(
+                    response, auth_csrf_token, max_age=self.session_max_age_seconds
+                )
 
             if isinstance(self.transport, BearerTransport):
                 return TokenResponse(
@@ -518,6 +563,7 @@ class FastAPIAccounts:
         @router.post(
             "/logout",
             summary="Revoke active session and log out",
+            openapi_extra=optional_openapi,
         )
         async def logout(
             request: Request,
@@ -554,6 +600,7 @@ class FastAPIAccounts:
         @router.post(
             "/change-password",
             summary="Change password for authenticated user",
+            dependencies=req_deps,
         )
         async def change_password(
             payload: ChangePasswordRequest,
@@ -612,6 +659,7 @@ class FastAPIAccounts:
             "/me",
             response_model=UserRead,
             summary="Retrieve current authenticated user profile",
+            dependencies=req_deps,
         )
         async def get_me(user: UserPrincipal = Depends(self.current_active_user)):
             return _to_user_read(user)

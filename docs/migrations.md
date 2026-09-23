@@ -179,7 +179,7 @@ class User(Base, UserMixin):
     __tablename__ = "users"
     # Custom application fields
     full_name: Mapped[str | None] = mapped_column(sa.String(255), nullable=True)
-    
+
     # Required for the adapter to populate `UserPrincipal.email` and `UserPrincipal.is_verified`
     emails: Mapped[list["EmailAddress"]] = relationship("EmailAddress", lazy="joined")
 

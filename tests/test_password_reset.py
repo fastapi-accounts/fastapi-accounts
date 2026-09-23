@@ -180,8 +180,14 @@ async def test_cross_action_token_isolation(cookie_accounts: FastAPIAccounts):
         )
 
         # 1. Try to use an email verification token to reset password
+        async with cookie_accounts.adapter.session_maker() as session:
+            user = await cookie_accounts.adapter.get_user_by_email(
+                session, "eve@example.com"
+            )
+            email_id = user.emails[0].id
+
         verify_token = cookie_accounts.service.generate_email_verification_token(
-            "eve@example.com"
+            user.id, email_id, "eve@example.com"
         )
         cross_resp1 = await client.post(
             "/api/v1/auth/reset-password",
