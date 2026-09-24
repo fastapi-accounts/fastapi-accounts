@@ -23,20 +23,22 @@ if not secret_key:
 adapter = SQLAlchemyAdapter(database_url="sqlite+aiosqlite:///./example_accounts.db")
 
 
-async def mock_delivery_hook(action: str, user: UserPrincipal, token: str) -> None:
-    # In a real application, construct a frontend URL and email it
-    _ = f"https://frontend.example.com/{action.replace('_', '-')}?token={token}"
-    # Do not log or print the actual token or secret-bearing URL in production!
-    print(f"[Mock Email] Sent {action} link to {user.email}")
+async def mock_register_hook(user: UserPrincipal, token: str) -> None:
+    _ = f"https://frontend.example.com/register?token={token}"
+    print(f"[Mock Email] Sent register link to {user.email}")
+
+
+async def mock_reset_hook(user: UserPrincipal, token: str) -> None:
+    _ = f"https://frontend.example.com/password-reset?token={token}"
+    print(f"[Mock Email] Sent password-reset link to {user.email}")
 
 
 accounts = FastAPIAccounts(
     adapter=adapter,
     secret_key=secret_key,
-    # Note: cookie_secure=False is used here for plain HTTP local testing. In production, leave cookie_secure=True (default).
     transport=CookieTransport(cookie_secure=False),
-    on_after_register=mock_delivery_hook,
-    on_after_request_password_reset=mock_delivery_hook,
+    on_after_register=mock_register_hook,
+    on_after_request_password_reset=mock_reset_hook,
 )
 
 

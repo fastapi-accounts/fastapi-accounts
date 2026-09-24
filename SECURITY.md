@@ -12,9 +12,9 @@ Only the latest released version of FastAPIAccounts is supported for security up
 
 Please **do not report security vulnerabilities through public GitHub issues, discussions, or pull requests**.
 
-If you believe you have found a security vulnerability, please send an email to security@fastapi-accounts.example.com privately.
+If you believe you have found a security vulnerability, please report it securely via the [GitHub Security Advisory form](https://github.com/fastapi-accounts/fastapi-accounts/security/advisories/new).
 
-In your email, include:
+In your report, include:
 - A description of the vulnerability and its impact.
 - Steps to reproduce the issue.
 - Any potential mitigation you suggest.
@@ -32,6 +32,6 @@ As an Alpha release, FastAPIAccounts defers certain complex architectural securi
 - **Brute Force & Enumeration:** Hardened endpoints with sliding-window rate limiting; constant-time string comparisons used for token validation.
 
 ### Deployment & Compromise Runbook
-1. **Secret Compromise:** If `FASTAPI_ACCOUNTS_SECRET_KEY` is compromised, deploy a new key immediately. The library will gracefully invalidate all existing pre-auth tokens, CSRF tokens, and active sessions (requiring users to log in again).
+1. **Secret Compromise:** If `FASTAPI_ACCOUNTS_SECRET_KEY` is compromised, deploy a new key immediately. The library will gracefully invalidate all existing pre-auth tokens, CSRF tokens, and email action tokens. **Note:** Active login sessions are database-backed and are not automatically revoked by changing the secret key. You must explicitly revoke them by clearing the active sessions in your database.
 2. **Database Leak:** Enforce a global password reset and cycle all secrets. `password_updated_at` timestamps will track recovery.
 3. **Key Rotation:** For zero-downtime key rotation, configure a multi-key strategy or rely on the `token_v` evolution planned for Phase 2. Currently, changing the key instantly rotates all cryptographic trust boundaries.
