@@ -94,7 +94,9 @@ def validate_csrf_token(
     if not cookie_token or not header_token:
         return False
 
-    if not hmac.compare_digest(cookie_token.encode("utf-8"), header_token.encode("utf-8")):
+    if not hmac.compare_digest(
+        cookie_token.encode("utf-8"), header_token.encode("utf-8")
+    ):
         return False
 
     payload = _verify_and_decode(cookie_token, signing_key)

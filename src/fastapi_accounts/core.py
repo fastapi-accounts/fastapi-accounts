@@ -146,8 +146,9 @@ class FastAPIAccounts:
                 resolved_keys.append(k)
 
         self.secret_keys = resolved_keys
-        
+
         import copy
+
         self.transport = copy.copy(transport) if transport else CookieTransport()
 
         self.verify_email_required = verify_email_required
