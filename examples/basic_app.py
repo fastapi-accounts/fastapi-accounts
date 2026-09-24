@@ -24,13 +24,21 @@ adapter = SQLAlchemyAdapter(database_url="sqlite+aiosqlite:///./example_accounts
 
 
 async def mock_register_hook(user: UserPrincipal, token: str) -> None:
-    _ = f"https://frontend.example.com/register?token={token}"
+    url = f"https://frontend.example.com/register?token={token}"
     print(f"[Mock Email] Sent register link to {user.email}")
+    print(f"[Mock Email] Action URL: {url[:38]}...[REDACTED]")
 
 
 async def mock_reset_hook(user: UserPrincipal, token: str) -> None:
-    _ = f"https://frontend.example.com/password-reset?token={token}"
+    url = f"https://frontend.example.com/password-reset?token={token}"
     print(f"[Mock Email] Sent password-reset link to {user.email}")
+    print(f"[Mock Email] Action URL: {url[:44]}...[REDACTED]")
+
+
+async def mock_delivery_failure(
+    action: str, user: UserPrincipal, exc: Exception
+) -> None:
+    print(f"[Mock Email] Failed to send {action} email to {user.email}: {exc}")
 
 
 accounts = FastAPIAccounts(
@@ -39,6 +47,7 @@ accounts = FastAPIAccounts(
     transport=CookieTransport(cookie_secure=False),
     on_after_register=mock_register_hook,
     on_after_request_password_reset=mock_reset_hook,
+    on_delivery_failure=mock_delivery_failure,
 )
 
 
