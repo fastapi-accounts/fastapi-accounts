@@ -146,7 +146,10 @@ class FastAPIAccounts:
                 resolved_keys.append(k)
 
         self.secret_keys = resolved_keys
-        self.transport = transport or CookieTransport()
+        
+        import copy
+        self.transport = copy.copy(transport) if transport else CookieTransport()
+
         self.verify_email_required = verify_email_required
         self.session_max_age_seconds = session_max_age_seconds
         self.reset_password_token_max_age_seconds = reset_password_token_max_age_seconds

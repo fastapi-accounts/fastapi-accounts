@@ -162,17 +162,17 @@ class AccountService:
                 is_verified=is_verified,
                 is_superuser=is_superuser,
             )
-            await session.commit()
             principal = _to_principal(
                 user, clean_email, is_verified, email_record=email_rec
             )
+            token = self.generate_email_verification_token(
+                user.id, email_rec.id, clean_email
+            )
+            await session.commit()
         except Exception:
             await session.rollback()
             raise
 
-        token = self.generate_email_verification_token(
-            user.id, email_rec.id, clean_email
-        )
         await self._invoke_callback_safely(
             self.on_after_register, "register", principal, token
         )
@@ -443,8 +443,9 @@ class AccountService:
                 ip_address=ip_address,
                 user_agent=user_agent,
             )
+            session_id = session_rec.id
             await session.commit()
-            return raw_token, session_rec.id
+            return raw_token, session_id
         except Exception:
             await session.rollback()
             raise

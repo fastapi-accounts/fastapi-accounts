@@ -159,14 +159,27 @@ async def test_verification_token_rejection(cookie_accounts: FastAPIAccounts):
         resp = await client.post("/api/v1/auth/verify-email", json={"token": token})
         assert resp.status_code == 400
 
-        # Forge a token with token_v=2.0 (float)
+        # Create real user to ensure token failure is specifically due to float token_v
+        await client.post(
+            "/api/v1/auth/register",
+            json={"email": "real@example.com", "password": "SecurePassword123!"},
+        )
+        async with cookie_accounts.adapter.session_maker() as session:
+            user = await cookie_accounts.adapter.get_user_by_email(
+                session, "real@example.com"
+            )
+            assert user is not None
+            real_user_id = str(user.id)
+            real_email_id = str(user.emails[0].id)
+            
+        # Forge a token with token_v=2.0 (float) for real user
         token_float = cookie_accounts.service.token_signer.create_token(
             {
                 "action": "verify_email",
                 "token_v": 2.0,
-                "sub": str(uuid.uuid4()),
-                "email_id": str(uuid.uuid4()),
-                "email": "x@x.com",
+                "sub": real_user_id,
+                "email_id": real_email_id,
+                "email": "real@example.com",
             }
         )
         resp2 = await client.post(
@@ -253,3 +266,69 @@ async def test_verify_email_no_sql_after_commit(cookie_accounts: FastAPIAccounts
         assert len(post_commit_queries) == 0, (
             f"Queries executed after commit: {post_commit_queries}"
         )
+
+@pytest.mark.asyncio
+async def test_expire_on_commit_operations(async_engine):
+    from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession
+    from fastapi_accounts.adapters.sqlalchemy import SQLAlchemyAdapter
+    from fastapi_accounts import FastAPIAccounts, CookieTransport
+    from fastapi import FastAPI
+    from httpx import AsyncClient, ASGITransport
+    
+    # Configure session maker with expire_on_commit=True
+    session_maker = async_sessionmaker(
+        bind=async_engine, class_=AsyncSession, expire_on_commit=True
+    )
+    adapter = SQLAlchemyAdapter(session_maker=session_maker, engine=async_engine)
+    await adapter.create_all()
+    
+    accounts = FastAPIAccounts(
+        adapter=adapter,
+        secret_key="secret" * 8,
+        transport=CookieTransport(cookie_secure=False, csrf_protect=False)
+    )
+    
+    app = FastAPI()
+    app.include_router(accounts.router, prefix="/auth")
+    
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # Test Registration
+        res = await client.post("/auth/register", json={"email": "expire@example.com", "password": "SecurePassword123!"})
+        assert res.status_code == 201, res.text
+        
+        # Test Login
+        res = await client.post("/auth/login", json={"email": "expire@example.com", "password": "SecurePassword123!"})
+        assert res.status_code == 200, res.text
+
+def test_csrf_non_ascii_handling():
+    from fastapi_accounts.security.csrf import validate_csrf_token
+    # Pass non-ASCII values; it should return False instead of raising an exception
+    assert not validate_csrf_token("abc🚀", "abc🚀", None, b"secret" * 8)
+
+def test_fastapi_accounts_transport_isolation():
+    from fastapi_accounts import FastAPIAccounts, CookieTransport
+    
+    shared_transport = CookieTransport(max_age=10)
+    
+    from fastapi_accounts.adapters.sqlalchemy import SQLAlchemyAdapter
+    adapter = SQLAlchemyAdapter(database_url="sqlite+aiosqlite:///:memory:")
+    accounts_a = FastAPIAccounts(
+        adapter=adapter,
+        secret_key="secret_secret_secret_secret_secret_secret_secret_secret_secret_secret_secret_secret_secret_secret_secret_secret_secret_secret_secret_secret_secret_secret_secret_secret",
+        allow_legacy_tokens=False,
+        transport=shared_transport,
+        session_max_age_seconds=61
+    )
+    
+    accounts_b = FastAPIAccounts(
+        adapter=adapter,
+        secret_key="secret_secret_secret_secret_secret_secret_secret_secret_secret_secret_secret_secret_secret_secret_secret_secret_secret_secret_secret_secret_secret_secret_secret_secret",
+        allow_legacy_tokens=False,
+        transport=shared_transport,
+        session_max_age_seconds=999
+    )
+    
+    assert accounts_a.transport.max_age == 61
+    assert accounts_b.transport.max_age == 999
+    assert accounts_a.transport is not accounts_b.transport
