@@ -29,12 +29,12 @@ FastAPI Accounts focuses strictly on email/password flows. It **does not** provi
 
 Install via pip:
 ```bash
-pip install "fastapi-accounts[sqlite]"
+pip install --pre "fastapi-accounts[sqlite]"
 ```
 
 To include the PostgreSQL driver and packaged Alembic migrations, install with the `postgres` and `migrations` extras:
 ```bash
-pip install "fastapi-accounts[postgres,migrations]"
+pip install --pre "fastapi-accounts[postgres,migrations]"
 ```
 
 ---
@@ -107,7 +107,7 @@ Your application supplies email delivery through callbacks. FastAPI Accounts gen
 
 Without a callback, the library simply logs a notification event and returns. You must hook into `on_after_request_password_reset` or `on_after_register` to dispatch the emails.
 
-For a complete example showing token delivery, frontend URL construction and callback-failure handling, see [examples/basic_app.py](examples/basic_app.py).
+For an introductory example showing token lifecycle, frontend URL construction via console logging (mock delivery), and callback-failure handling, see [examples/basic_app.py](examples/basic_app.py).
 
 ---
 
@@ -167,3 +167,7 @@ For vulnerability reporting and our security policy, please read [SECURITY.md](S
 
 ### License
 FastAPI Accounts is licensed under the [Apache License 2.0](LICENSE).
+
+## Architecture
+
+FastAPI Accounts is currently in an alpha state. While the backend persistence and services are properly delineated, the HTTP API (`FastAPIAccounts._build_router`) is currently bundled as a single large factory method that owns policy, dependency injection, and routing. **This separation of concerns (splitting the domain services from the router) is formally designated as deferred pre-1.0 technical debt.** This structural design does not represent a runtime security vulnerability and is planned for a subsequent refactoring phase prior to `1.0.0`.

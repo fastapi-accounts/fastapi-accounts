@@ -30,8 +30,8 @@ def test_openapi_route_semantics(cookie_accounts: FastAPIAccounts):
         {},
     ]
     assert paths["/api/v1/auth/csrf"]["get"]["security"] == [{"APIKeyCookie": []}, {}]
-    assert "security" not in paths["/api/v1/auth/verify-email"]["post"]
-    assert "security" not in paths["/api/v1/auth/reset-password"]["post"]
+    assert paths["/api/v1/auth/verify-email"]["post"]["security"] == [{"APIKeyCookie": []}, {}]
+    assert paths["/api/v1/auth/reset-password"]["post"]["security"] == [{"APIKeyCookie": []}, {}]
 
     # Public routes
     assert "security" not in paths["/api/v1/auth/register"]["post"]

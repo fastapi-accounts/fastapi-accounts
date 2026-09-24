@@ -386,6 +386,7 @@ class FastAPIAccounts:
         @router.post(
             "/verify-email",
             summary="Verify email address with verification token",
+            openapi_extra=optional_openapi,
         )
         async def verify_email(
             payload: EmailVerificationRequest,
@@ -469,6 +470,7 @@ class FastAPIAccounts:
         @router.post(
             "/reset-password",
             summary="Reset user password with a reset token",
+            openapi_extra=optional_openapi,
         )
         async def reset_password(
             payload: ResetPasswordRequest,
