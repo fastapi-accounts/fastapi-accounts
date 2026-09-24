@@ -124,7 +124,7 @@ With the core vertical slice validated, we immediately tackled the most critical
 * Enforced **mandatory re-authentication** (`current_password` verification) to prevent unauthorized takeover from unattended devices.
 * Added **selective session revocation**: by default (`revoke_other_sessions=True`), changing a password logs out all *other* devices while keeping the caller's current session seamless and active.
 
-### 3. 100% Test Coverage & Standardized Operations
+### 3. Extensive Test Coverage & Standardized Operations
 * Expanded our automated test suite to **18 end-to-end tests** running in `< 2.0s`.
 * Documented every QA check and PyPI deployment step in a comprehensive [**RELEASE.md**](RELEASE.md) guide.
 * Shipped the full implementation in Pull Request [#3](https://github.com/fastapi-accounts/fastapi-accounts/pull/3).
@@ -138,8 +138,8 @@ In late September 2026, we subjected the entire codebase to an exhaustive P0 sec
 1. **Monotonic Credential Versioning with CAS:** Password mutations utilize atomic SQL Compare-and-Swap on `credential_version >= 1`, guaranteeing replay immunity even under frozen system clocks.
 2. **Asynchronous Bounded Argon2id Hashing:** Offloaded password hashing to worker threads bounded by concurrency limiters with length bounds and constant-time dummy verification.
 3. **Session-Bound Double-Submit CSRF:** Isolated pre-auth and session-bound CSRF lifecycles with strict host-exact `Origin`/`Referer` validation.
-4. **Service / Store Separation & Observable Transactions:** Complete architectural separation with pure stores, service-owned transaction boundaries, and error-contained post-commit callbacks.
-5. **Deterministic Migration Lineage & Fingerprinted Adoption:** Full Alembic migration suite (0001-0004) with synchronous `psycopg` PostgreSQL CI execution and structural schema fingerprinting.
+4. **Service / Store Separation & Observable Transactions:** Service-owned transaction boundaries and robust token separation (Note: Full three-way architecture split deferred to post-alpha Phase 2), and error-contained post-commit callbacks.
+5. **Deterministic Migration Lineage & Fingerprinted Adoption:** Full Alembic migration suite (0001-0005) with synchronous `psycopg` PostgreSQL CI execution and structural schema fingerprinting.
 
 ---
 

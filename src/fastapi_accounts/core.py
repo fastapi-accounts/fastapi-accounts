@@ -110,6 +110,22 @@ class FastAPIAccounts:
         allow_legacy_tokens: bool = False,
     ):
         self.adapter = adapter
+        if type(session_max_age_seconds) is not int or session_max_age_seconds <= 0:
+            raise ValueError("session_max_age_seconds must be a positive integer")
+        if (
+            type(pre_auth_csrf_max_age_seconds) is not int
+            or pre_auth_csrf_max_age_seconds <= 0
+        ):
+            raise ValueError("pre_auth_csrf_max_age_seconds must be a positive integer")
+        if (
+            type(reset_password_token_max_age_seconds) is not int
+            or reset_password_token_max_age_seconds <= 0
+        ):
+            raise ValueError(
+                "reset_password_token_max_age_seconds must be a positive integer"
+            )
+        if type(argon2_concurrency) is not int or argon2_concurrency <= 0:
+            raise ValueError("argon2_concurrency must be a positive integer")
 
         # Resolve secret key sequence
         raw_keys: list[str]
@@ -212,8 +228,16 @@ class FastAPIAccounts:
                 APIKeyCookie(name=self.transport.cookie_name, auto_error=False)
             )
         elif isinstance(self.transport, BearerTransport):
-            self.openapi_scheme_name = "HTTPBearer"
-            self.openapi_scheme_dependency = Security(HTTPBearer(auto_error=False))
+            if self.transport.header_name.lower() == "authorization":
+                self.openapi_scheme_name = "HTTPBearer"
+                self.openapi_scheme_dependency = Security(HTTPBearer(auto_error=False))
+            else:
+                self.openapi_scheme_name = "APIKeyHeader"
+                from fastapi.security import APIKeyHeader
+
+                self.openapi_scheme_dependency = Security(
+                    APIKeyHeader(name=self.transport.header_name, auto_error=False)
+                )
 
         self.router = self._build_router()
 
@@ -270,7 +294,7 @@ class FastAPIAccounts:
     def _build_router(self) -> APIRouter:
         router = APIRouter()
 
-        optional_openapi = {}
+        optional_openapi: dict[str, Any] = {}
         if self.openapi_scheme_name:
             optional_openapi = {"security": [{self.openapi_scheme_name: []}, {}]}
 
@@ -358,7 +382,6 @@ class FastAPIAccounts:
         @router.post(
             "/verify-email",
             summary="Verify email address with verification token",
-            openapi_extra=optional_openapi,
         )
         async def verify_email(
             payload: EmailVerificationRequest,
@@ -442,7 +465,6 @@ class FastAPIAccounts:
         @router.post(
             "/reset-password",
             summary="Reset user password with a reset token",
-            openapi_extra=optional_openapi,
         )
         async def reset_password(
             payload: ResetPasswordRequest,

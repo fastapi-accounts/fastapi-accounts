@@ -105,6 +105,7 @@ async def test_a01_injected_commit_failure_verify_email(
             user = await cookie_accounts.adapter.get_user_by_email(
                 session, "unverified@example.com"
             )
+            assert user is not None
             email_id = user.emails[0].id
 
         token = cookie_accounts.service.generate_email_verification_token(

@@ -49,6 +49,7 @@ async def test_cookie_transport_vertical_slice(cookie_accounts: FastAPIAccounts)
             user = await cookie_accounts.adapter.get_user_by_email(
                 session, "alice@example.com"
             )
+            assert user is not None
             email_id = user.emails[0].id
 
         token = cookie_accounts.service.generate_email_verification_token(

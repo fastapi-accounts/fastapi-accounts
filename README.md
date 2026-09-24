@@ -29,7 +29,7 @@ FastAPI Accounts focuses strictly on email/password flows. It **does not** provi
 
 Install via pip:
 ```bash
-pip install fastapi-accounts
+pip install "fastapi-accounts[sqlite]"
 ```
 
 To include the PostgreSQL driver and packaged Alembic migrations, install with the `postgres` and `migrations` extras:

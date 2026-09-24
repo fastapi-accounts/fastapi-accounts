@@ -1,11 +1,11 @@
+import asyncio
+import uuid
+
 import pytest
 from fastapi import FastAPI
-from fastapi.testclient import TestClient
 from fastapi.openapi.utils import get_openapi
 from httpx import ASGITransport, AsyncClient
-import uuid
-import asyncio
-from sqlalchemy.ext.asyncio import AsyncSession
+
 from fastapi_accounts.core import FastAPIAccounts
 from fastapi_accounts.transports.cookie import CookieTransport
 
@@ -30,14 +30,8 @@ def test_openapi_route_semantics(cookie_accounts: FastAPIAccounts):
         {},
     ]
     assert paths["/api/v1/auth/csrf"]["get"]["security"] == [{"APIKeyCookie": []}, {}]
-    assert paths["/api/v1/auth/verify-email"]["post"]["security"] == [
-        {"APIKeyCookie": []},
-        {},
-    ]
-    assert paths["/api/v1/auth/reset-password"]["post"]["security"] == [
-        {"APIKeyCookie": []},
-        {},
-    ]
+    assert "security" not in paths["/api/v1/auth/verify-email"]["post"]
+    assert "security" not in paths["/api/v1/auth/reset-password"]["post"]
 
     # Public routes
     assert "security" not in paths["/api/v1/auth/register"]["post"]
@@ -76,20 +70,25 @@ async def test_no_password_loaded_on_me(cookie_accounts: FastAPIAccounts):
         ):
             queries.append(statement)
 
+        engine = cookie_accounts.adapter.engine
+        assert engine is not None
         sa.event.listen(
-            cookie_accounts.adapter.engine.sync_engine,
+            engine.sync_engine,
             "before_cursor_execute",
             before_cursor_execute,
         )
 
         try:
             me_resp = await client.get(
-                "/api/v1/auth/me", cookies={"fastapi_accounts_session": cookie}
+                "/api/v1/auth/me",
+                cookies={"fastapi_accounts_session": cookie},  # type: ignore
             )
             assert me_resp.status_code == 200
         finally:
+            engine = cookie_accounts.adapter.engine
+            assert engine is not None
             sa.event.remove(
-                cookie_accounts.adapter.engine.sync_engine,
+                engine.sync_engine,
                 "before_cursor_execute",
                 before_cursor_execute,
             )
@@ -110,7 +109,7 @@ async def test_concurrent_verification_replay(cookie_accounts: FastAPIAccounts):
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        reg = await client.post(
+        _ = await client.post(
             "/api/v1/auth/register",
             json={"email": "concurrent@example.com", "password": "SecurePassword123!"},
         )
@@ -119,6 +118,7 @@ async def test_concurrent_verification_replay(cookie_accounts: FastAPIAccounts):
             user = await cookie_accounts.adapter.get_user_by_email(
                 session, "concurrent@example.com"
             )
+            assert user is not None
             email_id = user.emails[0].id
 
         token = cookie_accounts.service.generate_email_verification_token(
@@ -142,9 +142,37 @@ async def test_concurrent_verification_replay(cookie_accounts: FastAPIAccounts):
 # 4. Token identity rejection tests
 @pytest.mark.asyncio
 async def test_verification_token_rejection(cookie_accounts: FastAPIAccounts):
-    # Try with missing/malformed UUIDs
-    # Token payload requires sub and email_id to be UUIDs.
-    pass
+    app = FastAPI()
+    app.include_router(cookie_accounts.router, prefix="/api/v1/auth")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # Forge a token with an invalid email_id
+        token = cookie_accounts.service.token_signer.create_token(
+            {
+                "action": "verify_email",
+                "token_v": 2,
+                "sub": str(uuid.uuid4()),
+                "email_id": "not-a-uuid",
+                "email": "x@x.com",
+            }
+        )
+        resp = await client.post("/api/v1/auth/verify-email", json={"token": token})
+        assert resp.status_code == 400
+
+        # Forge a token with token_v=2.0 (float)
+        token_float = cookie_accounts.service.token_signer.create_token(
+            {
+                "action": "verify_email",
+                "token_v": 2.0,
+                "sub": str(uuid.uuid4()),
+                "email_id": str(uuid.uuid4()),
+                "email": "x@x.com",
+            }
+        )
+        resp2 = await client.post(
+            "/api/v1/auth/verify-email", json={"token": token_float}
+        )
+        assert resp2.status_code == 400
 
 
 # 5. Cookie max_age deprecation
@@ -153,14 +181,14 @@ def test_cookie_transport_max_age_deprecation():
 
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
-        t = CookieTransport(max_age=3600)
+        _ = CookieTransport(max_age=3600)
         assert len(w) == 1
         assert issubclass(w[-1].category, DeprecationWarning)
         assert "CookieTransport(max_age=...) is deprecated" in str(w[-1].message)
 
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
-        t2 = CookieTransport()
+        _ = CookieTransport()
         assert len(w) == 0
 
 
@@ -174,7 +202,7 @@ async def test_verify_email_no_sql_after_commit(cookie_accounts: FastAPIAccounts
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        reg = await client.post(
+        _ = await client.post(
             "/api/v1/auth/register",
             json={"email": "nosql@example.com", "password": "SecurePassword123!"},
         )
@@ -183,6 +211,7 @@ async def test_verify_email_no_sql_after_commit(cookie_accounts: FastAPIAccounts
             user = await cookie_accounts.adapter.get_user_by_email(
                 session, "nosql@example.com"
             )
+            assert user is not None
             email_id = user.emails[0].id
 
         token = cookie_accounts.service.generate_email_verification_token(
@@ -194,29 +223,31 @@ async def test_verify_email_no_sql_after_commit(cookie_accounts: FastAPIAccounts
         in_commit = False
         post_commit_queries = []
 
+        def after_commit(session):
+            nonlocal in_commit
+            in_commit = True
+
         def before_execute(conn, cursor, statement, parameters, context, executemany):
             queries.append(statement)
-            if "COMMIT" in statement.upper():
-                nonlocal in_commit
-                in_commit = True
-            elif in_commit:
+            if in_commit:
                 post_commit_queries.append(statement)
 
-        sa.event.listen(
-            cookie_accounts.adapter.engine.sync_engine,
-            "before_cursor_execute",
-            before_execute,
-        )
+        from sqlalchemy.orm import Session
+
+        sa.event.listen(Session, "after_commit", after_commit)
+
+        engine = cookie_accounts.adapter.engine
+        assert engine is not None
+        sa.event.listen(engine.sync_engine, "before_cursor_execute", before_execute)
 
         try:
             resp = await client.post("/api/v1/auth/verify-email", json={"token": token})
             assert resp.status_code == 200
         finally:
-            sa.event.remove(
-                cookie_accounts.adapter.engine.sync_engine,
-                "before_cursor_execute",
-                before_execute,
-            )
+            sa.event.remove(Session, "after_commit", after_commit)
+            engine = cookie_accounts.adapter.engine
+            assert engine is not None
+            sa.event.remove(engine.sync_engine, "before_cursor_execute", before_execute)
 
         # Ensure there were NO queries executed after the COMMIT.
         assert len(post_commit_queries) == 0, (

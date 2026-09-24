@@ -38,7 +38,7 @@ class UserStoreProtocol(Protocol):
     ) -> tuple[User, EmailAddress]: ...
 
     async def verify_email(
-        self, session: AsyncSession, email: str
+        self, session: AsyncSession, email_id: uuid.UUID, user_id: uuid.UUID, email: str
     ) -> EmailAddress | None: ...
 
     async def create_session(

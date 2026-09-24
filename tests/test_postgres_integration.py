@@ -479,3 +479,63 @@ async def test_postgres_migration_and_cas_concurrency():
         command.check(alembic_cfg)
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_postgres_verification_concurrency():
+    if not POSTGRES_URL:
+        pytest.skip("TEST_POSTGRES_URL not set")
+
+    import asyncio
+    import uuid
+
+    from fastapi import FastAPI
+    from httpx import ASGITransport, AsyncClient
+
+    from fastapi_accounts import CookieTransport, FastAPIAccounts, SQLAlchemyAdapter
+
+    adapter = SQLAlchemyAdapter(database_url=POSTGRES_URL)
+    await adapter.create_all()
+    accounts = FastAPIAccounts(
+        adapter=adapter,
+        secret_key="pg_secret_pg_secret_pg_secret_pg_secret_pg_secret_pg_secret_pg_secret_",
+        transport=CookieTransport(cookie_secure=False, csrf_protect=False),
+    )
+
+    app = FastAPI()
+    app.include_router(accounts.router, prefix="/api/v1/auth")
+
+    transport = ASGITransport(app=app)
+
+    unique_email = f"pg_concurrent_{uuid.uuid4().hex}@example.com"
+
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/api/v1/auth/register",
+            json={
+                "email": unique_email,
+                "password": "SecurePassword123!",
+            },
+        )
+        assert resp.status_code == 201
+
+        async with accounts.adapter.session_maker() as session:
+            user = await accounts.adapter.get_user_by_email(session, unique_email)
+            assert user is not None
+            email_id = user.emails[0].id
+
+        token = accounts.service.generate_email_verification_token(
+            user.id, email_id, unique_email
+        )
+
+        async def verify():
+            async with AsyncClient(transport=transport, base_url="http://test") as c:
+                return await c.post("/api/v1/auth/verify-email", json={"token": token})
+
+        results = await asyncio.gather(*[verify() for _ in range(5)])
+
+        successes = sum(1 for r in results if r.status_code == 200)
+        failures = sum(1 for r in results if r.status_code == 400)
+
+        assert successes == 1
+        assert failures == 4

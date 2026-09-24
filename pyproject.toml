@@ -12,7 +12,7 @@ requires-python = ">=3.10"
 authors = [
     { name = "FastAPI Accounts Contributors" }
 ]
-keywords = ["fastapi", "authentication", "oauth2", "account-management", "jwt", "passkeys", "sessions"]
+keywords = ["fastapi", "authentication", "account-management", "sessions"]
 classifiers = [
     "Development Status :: 2 - Pre-Alpha",
     "Framework :: FastAPI",

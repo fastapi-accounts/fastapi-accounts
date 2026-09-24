@@ -178,6 +178,54 @@ class AccountService:
         )
         return principal, token
 
+    def _parse_strict_action_token(
+        self, token: str, expected_action: str
+    ) -> dict | None:
+        """Parse, validate, and strictly type-check a signed action token."""
+        import uuid
+
+        from fastapi_accounts.security.tokens import KeyKind
+
+        try:
+            payload, key_kind = self.token_signer.verify_token_with_kind(token)
+        except Exception:
+            return None
+
+        if not payload or key_kind != KeyKind.DERIVED:
+            return None
+
+        token_v = payload.get("token_v")
+        if type(token_v) is not int or token_v != 2:
+            return None
+
+        if payload.get("action") != expected_action:
+            return None
+
+        sub = payload.get("sub")
+        if type(sub) is not str:
+            return None
+
+        try:
+            uuid.UUID(sub)
+        except ValueError:
+            return None
+
+        if expected_action == "verify_email":
+            email = payload.get("email")
+            email_id = payload.get("email_id")
+            if type(email) is not str or type(email_id) is not str:
+                return None
+            email = email.strip()
+            if not email:
+                return None
+            payload["email"] = email
+            try:
+                uuid.UUID(email_id)
+            except ValueError:
+                return None
+
+        return payload
+
     async def authenticate_user(
         self, session: AsyncSession, email: str, password: str
     ) -> tuple[UserPrincipal | None, int | None]:
@@ -245,22 +293,11 @@ class AccountService:
         self, session: AsyncSession, token: str, new_password: str
     ) -> bool:
         """Reset password using versioned token with atomic compare-and-swap update."""
-        from fastapi_accounts.security.tokens import KeyKind
-
-        payload, key_kind = self.token_signer.verify_token_with_kind(token)
-        if (
-            not payload
-            or key_kind != KeyKind.DERIVED
-            or payload.get("token_v") != 2
-            or payload.get("action") != "reset_password"
-            or "sub" not in payload
-        ):
+        payload = self._parse_strict_action_token(token, "reset_password")
+        if not payload:
             return False
 
-        try:
-            user_id = uuid.UUID(payload["sub"])
-        except (ValueError, KeyError):
-            return False
+        user_id = uuid.UUID(payload["sub"])
 
         cred_v = payload.get("cred_v")
         if type(cred_v) is not int or cred_v < 1:
@@ -356,30 +393,13 @@ class AccountService:
         self, session: AsyncSession, token: str
     ) -> UserPrincipal | None:
         """Validate email verification token and mark address verified."""
-        from fastapi_accounts.security.tokens import KeyKind
-
-        payload, key_kind = self.token_signer.verify_token_with_kind(token)
-        if not payload or payload.get("action") != "verify_email":
+        payload = self._parse_strict_action_token(token, "verify_email")
+        if not payload:
             return None
 
-        if payload.get("token_v") != 2:
-            return None
-
-        if key_kind == KeyKind.RAW_FALLBACK and not self.allow_legacy_tokens:
-            return None
-
-        email = payload.get("email")
-        sub_str = payload.get("sub")
-        email_id_str = payload.get("email_id")
-
-        if not email or not sub_str or not email_id_str:
-            return None
-
-        try:
-            user_id = uuid.UUID(sub_str)
-            email_id = uuid.UUID(email_id_str)
-        except ValueError:
-            return None
+        email = payload["email"]
+        user_id = uuid.UUID(payload["sub"])
+        email_id = uuid.UUID(payload["email_id"])
 
         try:
             email_rec = await self.store.verify_email(session, email_id, user_id, email)

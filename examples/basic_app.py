@@ -22,10 +22,13 @@ if not secret_key:
 
 adapter = SQLAlchemyAdapter(database_url="sqlite+aiosqlite:///./example_accounts.db")
 
-async def mock_delivery_hook(user: UserPrincipal, token: str, request) -> None:
-    # In a real application, email the token to user.email
-    # Do not log or print the token or secret-bearing URL in production!
-    print(f"[Mock Email] Sent link to {user.email}")
+
+async def mock_delivery_hook(action: str, user: UserPrincipal, token: str) -> None:
+    # In a real application, construct a frontend URL and email it
+    _ = f"https://frontend.example.com/{action.replace('_', '-')}?token={token}"
+    # Do not log or print the actual token or secret-bearing URL in production!
+    print(f"[Mock Email] Sent {action} link to {user.email}")
+
 
 accounts = FastAPIAccounts(
     adapter=adapter,
