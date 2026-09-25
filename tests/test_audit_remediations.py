@@ -144,6 +144,14 @@ async def test_concurrent_verification_replay(cookie_accounts: FastAPIAccounts):
         assert successes == 1
         assert failures == 4
 
+        # Verify that it is actually persisted!
+        async with cookie_accounts.adapter.session_maker() as session:
+            final_user = await cookie_accounts.adapter.get_user_by_email(
+                session, "concurrent@example.com"
+            )
+            assert final_user is not None
+            assert final_user.emails[0].is_verified is True
+
 
 # 4. Token identity rejection tests
 @pytest.mark.asyncio

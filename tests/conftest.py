@@ -1,6 +1,9 @@
+import os
+import tempfile
+
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.pool import StaticPool
+from sqlalchemy.pool import NullPool
 
 from fastapi_accounts.adapters.sqlalchemy import SQLAlchemyAdapter
 from fastapi_accounts.core import FastAPIAccounts
@@ -11,16 +14,22 @@ from fastapi_accounts.transports.cookie import CookieTransport
 
 @pytest.fixture
 async def async_engine():
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
     engine = create_async_engine(
-        "sqlite+aiosqlite:///:memory:",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
+        f"sqlite+aiosqlite:///{path}",
+        connect_args={"timeout": 15.0},
+        poolclass=NullPool,
         echo=False,
     )
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     yield engine
     await engine.dispose()
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 @pytest.fixture

@@ -27,15 +27,18 @@ FastAPI Accounts focuses strictly on email/password flows. It **does not** provi
 
 ## Installation
 
-Install via pip:
+> **Note:** The `v0.1.0` alpha series is currently undergoing rapid security hardening. The packages available on PyPI (`a0`-`a3`) are outdated. To install the fully audited `a5` security candidate, please install directly from the source repository.
+
+Install the audited `a5` source directly via pip:
 ```bash
-pip install --pre "fastapi-accounts[sqlite]"
+pip install "fastapi-accounts[sqlite] @ git+https://github.com/fastapi-accounts/fastapi-accounts.git@v0.1.0a5"
 ```
 
-To include the PostgreSQL driver and packaged Alembic migrations, install with the `postgres` and `migrations` extras:
+To include the PostgreSQL driver and packaged Alembic migrations:
 ```bash
-pip install --pre "fastapi-accounts[postgres,migrations]"
+pip install "fastapi-accounts[postgres,migrations] @ git+https://github.com/fastapi-accounts/fastapi-accounts.git@v0.1.0a5"
 ```
+
 
 ---
 
