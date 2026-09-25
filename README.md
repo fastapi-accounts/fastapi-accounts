@@ -91,6 +91,39 @@ Run with Uvicorn:
 uvicorn main:app --reload
 ```
 
+### Client Interaction & CSRF
+
+FastAPI Accounts runs securely by default, which means **CSRF protection is strictly enforced**. 
+
+To successfully call state-changing endpoints like `/register` or `/login` from a frontend client, you must bootstrap a CSRF session:
+
+1. **Fetch a CSRF token:** 
+   Send a `GET` request to `/api/v1/auth/csrf`. This returns a JSON payload containing the `csrf_token` and sets an HttpOnly cookie.
+2. **Include Headers:** 
+   When submitting your `POST` request, you must include:
+   - The returned token in the `X-CSRF-Token` header.
+   - A valid same-origin `Origin` header (e.g. `Origin: http://localhost:8000`).
+   - Your cookies (so the backend receives the HttpOnly CSRF cookie).
+
+Example registration flow:
+```javascript
+// 1. Fetch CSRF token
+const csrfResponse = await fetch('http://localhost:8000/api/v1/auth/csrf');
+const { csrf_token } = await csrfResponse.json();
+
+// 2. Submit Registration
+await fetch('http://localhost:8000/api/v1/auth/register', {
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json',
+    'X-CSRF-Token': csrf_token,
+    'Origin': 'http://localhost:8000'
+  },
+  body: JSON.stringify({ email: "user@example.com", password: "SecurePassword123!" })
+});
+```
+
+
 ---
 
 ## Cookie versus Bearer Behavior

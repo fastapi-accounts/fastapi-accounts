@@ -5,8 +5,8 @@ Only the latest released version of FastAPIAccounts is supported for security up
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.1.x   | :white_check_mark: |
-| < 0.1.0 | :x:                |
+| >= 0.1.0a5 (Latest Prerelease) | :white_check_mark: |
+| < 0.1.0a5 | :x:                |
 
 ## Reporting a Vulnerability
 
@@ -19,7 +19,7 @@ In your report, include:
 - Steps to reproduce the issue.
 - Any potential mitigation you suggest.
 
-You should expect a response within 48 hours. If the vulnerability is confirmed, we will coordinate a fix and an advisory before any public disclosure.
+If the vulnerability is confirmed, we will coordinate a fix and an advisory before any public disclosure.
 
 ## Known Limitations (Alpha / Phase 1)
 As an Alpha release, FastAPIAccounts defers certain complex architectural security constraints (like full multi-tenant read-replica isolation and zero-downtime key rotation pipelines) to later phases. Standard endpoint protections, token bindings, and CAS verifications are active.
@@ -34,4 +34,4 @@ As an Alpha release, FastAPIAccounts defers certain complex architectural securi
 ### Deployment & Compromise Runbook
 1. **Secret Compromise:** If `FASTAPI_ACCOUNTS_SECRET_KEY` is compromised, deploy a new key immediately. The library will gracefully invalidate all existing pre-auth tokens, CSRF tokens, and email action tokens. **Note:** Active login sessions are database-backed and are not automatically revoked by changing the secret key. You must explicitly revoke them by clearing the active sessions in your database.
 2. **Database Leak:** Enforce a global password reset and cycle all secrets. `password_updated_at` timestamps will track recovery.
-3. **Key Rotation:** For zero-downtime key rotation, configure a multi-key strategy or rely on the `token_v` evolution planned for Phase 2. Currently, changing the key instantly invalidates all stateless cryptographic tokens (such as CSRF and email verification tokens), as old signing keys are not retained. Database-backed login sessions remain unaffected.
+3. **Key Rotation:** For zero-downtime key rotation, configure a multi-key strategy or rely on the `token_v` evolution planned for Phase 2. To rotate keys gracefully without invalidating active stateless tokens (like email verification links), pass a list of strings to `secret_key` during initialization (e.g. `['new_key', 'old_key']`). The first key is used for signing, and all keys are used for verification. If you completely replace the key instead, all active stateless tokens will be invalidated. Database-backed login sessions remain unaffected.
